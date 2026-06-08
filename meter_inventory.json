@@ -1,0 +1,120 @@
+{
+  "source": "Physical meter photos and local Itron Gen5 PDFs added 2026-06-07",
+  "notes": [
+    "Photo OCR/vision is subject to glare/reflection; LCD/register values are the least reliable observations.",
+    "Both physical meters appear to be Itron Gen5 Riva single-phase electric smart meters with integrated service switches.",
+    "The Opower metadata currently exposes two service point utility IDs but not the physical meter serial numbers, so serial-to-account mapping remains unconfirmed unless Eversource metadata or field labeling later links them."
+  ],
+  "meters": [
+    {
+      "meter_number": "METER-SERIAL-1",
+      "printed_form_and_number": "2S METER-SERIAL-1",
+      "barcode_text": "*1NFMETER-SERIAL-1AMI80*",
+      "module_or_nic_id": "NIC-ID-1",
+      "additional_id": "MODULE-ID-1",
+      "manufacturer": "Itron",
+      "product_family": "Gen5 Riva",
+      "radio_model": "G5R1",
+      "fcc_id": "SK9G5R1",
+      "ic_id": "864G-G5R1",
+      "ul_file": "E470764",
+      "service_specs": {
+        "class": "CL200",
+        "voltage": "240V",
+        "wires": "3W",
+        "type": "R2SMD",
+        "test_amps": "30TA",
+        "kh": "1.0Kh",
+        "form": "FM2S/2S",
+        "frequency": "60Hz",
+        "accuracy_class": "CA 0.5",
+        "register_description": "KWH/LP",
+        "switch": "w/Switch"
+      },
+      "photo_files": ["IMG_1688.jpeg", "IMG_1689.jpeg"],
+      "lcd_observations": [
+        "IMG_1688/1689 do not provide a reliable kWh register due to glare/cropping."
+      ],
+      "mapped_utility_id": null,
+      "mapping_confidence": "unmapped"
+    },
+    {
+      "meter_number": "METER-SERIAL-2",
+      "printed_form_and_number": "2S METER-SERIAL-2",
+      "barcode_text": "*1NFMETER-SERIAL-2AMI80*",
+      "module_or_nic_id": "NIC-ID-2",
+      "additional_id": "MODULE-ID-2",
+      "manufacturer": "Itron",
+      "product_family": "Gen5 Riva",
+      "radio_model": "G5R1",
+      "fcc_id": "SK9G5R1",
+      "ic_id": "864G-G5R1",
+      "ul_file": "E470764",
+      "service_specs": {
+        "class": "CL200",
+        "voltage": "240V",
+        "wires": "3W",
+        "type": "R2SMD",
+        "test_amps": "30TA",
+        "kh": "1.0Kh",
+        "form": "FM2S/2S",
+        "frequency": "60Hz",
+        "accuracy_class": "CA 0.5",
+        "register_description": "KWH/LP",
+        "switch": "w/Switch"
+      },
+      "photo_files": ["IMG_1686.jpeg", "IMG_1687.jpeg"],
+      "lcd_observations": [
+        "IMG_1687 appears to show display code 82 and numeric value about 10098, likely an energy register, but confidence is only medium due to glare/cropping.",
+        "IMG_1686 appears to show display code 82 and unit kVARh with a mostly-zero/uncertain value; do not treat it as a billing kWh reading."
+      ],
+      "mapped_utility_id": null,
+      "mapping_confidence": "unmapped"
+    }
+  ],
+  "model_capabilities_from_pdfs": {
+    "source_pdfs": [
+      "101763SP-03 Gen5 Riva Meter NAM (WEB)_final.pdf",
+      "Gen5 Network_Web.pdf",
+      "Positive Proof for Distributed Intelligence at the Grid Edge (WEB).pdf"
+    ],
+    "meter_family": "Itron Gen5 Riva Meter",
+    "communications": [
+      "Flexible two-way communications",
+      "On-demand readings from the meter",
+      "Meter reading, configuration update, and firmware download support",
+      "Gen5 IIoT/RF network; radio output power listed as 1W in product sheet"
+    ],
+    "profiles": [
+      "Load Profile: 16 channels, programmable 5/10/15/30/60 minute intervals",
+      "Instrumentation Profile: 16 channels, programmable 5/10/15/30/60 minute intervals",
+      "Voltage Profile: 16 channels, programmable 5/10/15/30/60 minute intervals"
+    ],
+    "quantities": [
+      "Wh delivered, received, unidirectional, net",
+      "VAh delivered, received, net",
+      "VARh delivered, received, net and quadrants Q1-Q4",
+      "Demand: max Watts delivered/received/net/unidirectional; max VA delivered/received; max VAR delivered/received/net/Q1-Q4; min power factor delivered/received"
+    ],
+    "distributed_intelligence_data": [
+      "Voltage and current waveforms",
+      "Sub-second RMS voltages and currents",
+      "Per-second directional per-phase Wh/VARh",
+      "Per-second directional per-phase W/VAR",
+      "Per-second per-phase VAh/VA",
+      "Per-second temperature"
+    ],
+    "events_and_features": [
+      "Recorded events and exceptions can be transmitted with interval data to head-end software",
+      "Real-time meter event and alarm retrieval supported by product family",
+      "Integrated remote disconnect/reconnect switch supported",
+      "Arc detection / meter-socket micro-arcing support",
+      "Power outage notification/last gasp: standard 25-second hold-up and extended 75-second hold-up per product sheet"
+    ],
+    "display": [
+      "Eight-digit LCD",
+      "Two-digit display code number",
+      "Display duration 1-15 seconds"
+    ]
+  }
+}
