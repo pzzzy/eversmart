@@ -49,13 +49,13 @@ class EversmartParserTests(unittest.TestCase):
         window.addEventListener('opower:unauthorized', function (event) {{
           var authorization = {{ accessToken: '{future_token}' }};
         }});
-        window.opowerApi.setEntityIds(['ENTITY-PRIMARY']);
+        window.opowerApi.setEntityIds(['ENTITY-TEST']);
         </script>
         """
         with patch.object(client, "request", return_value=html.encode()):
             client.load_databrowser()
         self.assertEqual(client.access_token, future_token)
-        self.assertEqual(client.entity_id, "ENTITY-PRIMARY")
+        self.assertEqual(client.entity_id, "ENTITY-TEST")
 
     def test_load_databrowser_replaces_expired_embedded_token(self):
         client = EversourceClient(cookie_file=Path("/tmp/no-such-cookie-file"), cookieinfo=Path("/tmp/no-such-cookieinfo"))
@@ -63,14 +63,14 @@ class EversmartParserTests(unittest.TestCase):
         html = f"""
         <script>
           var authorization = {{ accessToken: '{expired_token}' }};
-          window.opowerApi.setEntityIds(['ENTITY-PRIMARY']);
+          window.opowerApi.setEntityIds(['ENTITY-TEST']);
         </script>
         """
         client.obtain_fresh_opower_token = lambda force_login=False: setattr(client, "access_token", "fresh-token") or "fresh-token"
         with patch.object(client, "request", return_value=html.encode()):
             client.load_databrowser()
         self.assertEqual(client.access_token, "fresh-token")
-        self.assertEqual(client.entity_id, "ENTITY-PRIMARY")
+        self.assertEqual(client.entity_id, "ENTITY-TEST")
 
     def test_obtain_fresh_opower_token_uses_okta_session_redirect(self):
         client = EversourceClient(cookie_file=Path("/tmp/no-such-cookie-file"), cookieinfo=Path("/tmp/no-such-cookieinfo"))
@@ -99,13 +99,13 @@ class EversmartParserTests(unittest.TestCase):
         client = EversourceClient(cookie_file=Path("/tmp/no-such-cookie-file"), cookieinfo=Path("/tmp/no-such-cookieinfo"))
         metadata = {
             "data": {"billingAccountByAuthContext": {
-                "utilityId": "ENTITY-PRIMARY",
+                "utilityId": "ENTITY-TEST",
                 "urn": "acct-urn",
                 "serviceAgreementsConnection": {"edges": [{"node": {
                     "uuid": "sa-1",
                     "availableBillSegmentsInterval": "bill-start/bill-end",
                     "servicePointsConnection": {"edges": [{"node": {
-                        "uuid": "sp-1", "utilityId": "ACCOUNT-PRIMARY",
+                        "uuid": "sp-1", "utilityId": "ACCOUNT-TEST",
                         "premise": {"timeZone": "America/New_York", "uuid": "prem-1", "urn": "prem-urn"},
                         "registers": [
                             {"serviceQuantityIdentifier": "DELIVERED", "availableReadsTimeInterval": "x/y", "readResolution": "QUARTER_HOUR"},
@@ -115,11 +115,11 @@ class EversmartParserTests(unittest.TestCase):
                 }}]},
             }}
         }
-        target = client.find_target(metadata, "ACCOUNT-PRIMARY")
+        target = client.find_target(metadata, "ACCOUNT-TEST")
         self.assertEqual(target.service_agreement_uuid, "sa-1")
         self.assertEqual(target.service_point_uuid, "sp-1")
         self.assertEqual(target.available_interval, "a/b")
-        self.assertEqual(target.entity_id, "ENTITY-PRIMARY")
+        self.assertEqual(target.entity_id, "ENTITY-TEST")
         self.assertEqual(target.billing_account_urn, "acct-urn")
         self.assertEqual(target.premise_uuid, "prem-1")
         self.assertEqual(target.available_bill_interval, "bill-start/bill-end")
@@ -326,6 +326,24 @@ class DashboardSummaryTests(unittest.TestCase):
             self.assertEqual(data["errors"], [])
             self.assertEqual(data["warnings"][0]["warnings"], {"bill_forecast": "DataFetchingException"})
             self.assertIsNone(data["latest"]["error"])
+
+    def test_dashboard_template_uses_global_tooltips_time_aware_x_labels_and_peak_heatmap(self):
+        html = __import__("dashboard").HTML_TEMPLATE
+        self.assertIn("data-tip-id", html)
+        self.assertIn("showRunTip", html)
+        self.assertIn("xLabelFor(row,opt", html)
+        self.assertIn("renderDemandHeatmap", html)
+
+    def test_eia_benchmark_parser_converts_cents_to_dollars(self):
+        from dashboard import _parse_eia_price_rows
+        payload = {"response": {"data": [
+            {"period": "2026-03", "stateid": "MA", "stateDescription": "Massachusetts", "price": "30.21"},
+            {"period": "2026-03", "stateid": "US", "stateDescription": "United States", "price": "17.47"},
+        ]}}
+        rows = _parse_eia_price_rows(payload, "regional")
+        self.assertEqual(rows[0]["period"], "2026-03")
+        self.assertEqual(rows[0]["scope"], "regional")
+        self.assertAlmostEqual(rows[0]["price_per_kwh"], 0.3021)
 
     def test_dashboard_canvas_charts_render_x_axis_labels(self):
         with tempfile.TemporaryDirectory() as td:
