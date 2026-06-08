@@ -335,6 +335,22 @@ class DashboardSummaryTests(unittest.TestCase):
         self.assertIn("buildPriceSeries", html)
         self.assertNotIn("historical_price_series.filter(x=>x.price_per_kwh!=null).concat(eia)", html)
 
+    def test_eia_benchmark_fetch_falls_back_to_seed_data_when_api_unavailable(self):
+        import dashboard
+        original = dashboard.urllib.request.urlopen
+        dashboard._fetch_eia_benchmark_prices.cache_clear()
+        def fail(*args, **kwargs):
+            raise OSError("offline")
+        dashboard.urllib.request.urlopen = fail
+        try:
+            rows = dashboard._fetch_eia_benchmark_prices("MA")
+        finally:
+            dashboard.urllib.request.urlopen = original
+            dashboard._fetch_eia_benchmark_prices.cache_clear()
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertIn("regional", {r["scope"] for r in rows})
+        self.assertIn("national", {r["scope"] for r in rows})
+
     def test_dashboard_template_uses_global_tooltips_time_aware_x_labels_and_peak_heatmap(self):
         html = __import__("dashboard").HTML_TEMPLATE
         self.assertIn("data-tip-id", html)
