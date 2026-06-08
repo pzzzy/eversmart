@@ -24,8 +24,8 @@ from typing import Any, Iterable
 
 EVERSOURCE_DATABROWSER_URL = "https://www.eversource.com/cg/customer/UsageHistory/DataBrowser"
 OPOWER_GRAPHQL_URL = "https://ever.opower.com/ei/edge/apis/dsm-graphql-v1/cws/graphql"
-DEFAULT_ACCOUNT = os.environ.get("EVERSMART_ACCOUNT", "")
-DEFAULT_ENTITY_ID = os.environ.get("EVERSMART_ENTITY_ID", "")
+DEFAULT_ACCOUNT = "0061362115-51545561"
+DEFAULT_ENTITY_ID = "74005127621"
 LOGIN_URL = "https://www.eversource.com/security/account/login"
 MSLOGIN_URL = "https://www.eversource.com/security/account/MSLogin"
 RETURN_URL = "/cg/customer/UsageHistory/DataBrowser"
@@ -382,12 +382,13 @@ class EversourceClient:
         if "App-LogIn" in html or "/security/account/login" in html[:20000]:
             raise RuntimeError("Eversource session is not authenticated after login; refresh cookieinfo.txt or check MFA state.")
         token_match = re.search(r"accessToken:\s*'([^']+)'", html)
-        if not token_match:
-            raise RuntimeError("Authenticated DataBrowser loaded, but no Opower OAuth access token was found.")
         entity_match = re.search(r"setEntityIds\(\['([^']+)'\]\)", html)
-        self.access_token = token_match.group(1)
+        if token_match:
+            self.access_token = token_match.group(1)
+        else:
+            self.access_token = None
         self.entity_id = entity_match.group(1) if entity_match else DEFAULT_ENTITY_ID
-        if self._is_token_expired_or_stale(self.access_token):
+        if not self.access_token or self._is_token_expired_or_stale(self.access_token):
             self.obtain_fresh_opower_token(force_login=True)
         Path(".opower_access_token").write_text(f"{self.access_token}\n{self.entity_id}\n")
         try:
@@ -410,19 +411,35 @@ class EversourceClient:
             "Authorization": f"Bearer {self.access_token}",
             "Opower-Selected-Entities": json.dumps([f"urn:external:opower:entity:id:{selected}"]),
         }
-        try:
-            raw = self.request(OPOWER_GRAPHQL_URL, body, headers)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")
-            if _token_retry and exc.code in (401, 403) and ("expired" in detail.lower() or "invalid token" in detail.lower()):
-                self.login(force_refresh=True)
-                self.load_databrowser()
-                return self.graphql(query, variables, entity_id, _token_retry=False)
-            raise RuntimeError(f"Opower GraphQL HTTP {exc.code}: {detail}") from exc
-        data = json.loads(raw.decode())
-        if data.get("errors"):
-            raise RuntimeError(json.dumps(data["errors"], indent=2))
-        return data
+        retry_codes = {429, 500, 502, 503, 504}
+        attempts = 4
+        last_detail = ""
+        sleep = getattr(self, "_sleep", time.sleep)
+        for attempt in range(attempts):
+            try:
+                raw = self.request(OPOWER_GRAPHQL_URL, body, headers)
+                data = json.loads(raw.decode())
+                if data.get("errors"):
+                    raise RuntimeError(json.dumps(data["errors"], indent=2))
+                return data
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")
+                last_detail = f"Opower GraphQL HTTP {exc.code}: {detail}"
+                if _token_retry and exc.code in (401, 403) and ("expired" in detail.lower() or "invalid token" in detail.lower()):
+                    self.login(force_refresh=True)
+                    self.load_databrowser()
+                    return self.graphql(query, variables, entity_id, _token_retry=False)
+                if exc.code in retry_codes and attempt < attempts - 1:
+                    sleep(min(2 ** attempt, 8))
+                    continue
+                raise RuntimeError(last_detail) from exc
+            except (urllib.error.URLError, TimeoutError) as exc:
+                last_detail = f"Opower GraphQL transient network error: {exc}"
+                if attempt < attempts - 1:
+                    sleep(min(2 ** attempt, 8))
+                    continue
+                raise RuntimeError(last_detail) from exc
+        raise RuntimeError(last_detail or "Opower GraphQL request failed")
 
     def metadata(self) -> dict[str, Any]:
         return self.graphql(METADATA_QUERY, {
@@ -778,6 +795,22 @@ def write_optional_warning(run_dir: Path, name: str, exc: Exception, warnings: d
     (run_dir / f"{name}_warning.txt").write_text(str(exc))
 
 
+def is_transient_upstream_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(token in text for token in (
+        "http 500", "http 502", "http 503", "http 504", "http 429",
+        "bad gateway", "service unavailable", "gateway timeout", "too many requests",
+        "timed out", "temporarily unavailable",
+    ))
+
+
+def write_noncritical_issue(run_dir: Path, name: str, exc: Exception, errors: dict[str, str], warnings: dict[str, str], *, transient_as_warning: bool = True) -> None:
+    if transient_as_warning and is_transient_upstream_error(exc):
+        write_optional_warning(run_dir, name, exc, warnings)
+    else:
+        write_optional_error(run_dir, name, exc, errors)
+
+
 def run_tests() -> int:
     return subprocess.call([sys.executable, "-m", "unittest", "discover", "-v"])
 
@@ -844,7 +877,7 @@ def collect_once(client: EversourceClient, outdir: Path, account: str, interval:
         rdoc = client.rate_static_content(primary)
         write_json(run_dir / "rate_plan.json", rdoc)
     except Exception as exc:
-        write_optional_error(run_dir, "rate_plan", exc, errors)
+        write_noncritical_issue(run_dir, "rate_plan", exc, errors, warnings)
 
     gb_rows: list[dict[str, Any]] = []
     gb_manifest: dict[str, Any] | None = None
@@ -913,7 +946,7 @@ def collect_once(client: EversourceClient, outdir: Path, account: str, interval:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Retrieve Eversource smart-meter data via the embedded Opower DataBrowser API.")
-    ap.add_argument("--account", default=DEFAULT_ACCOUNT or None)
+    ap.add_argument("--account", default=DEFAULT_ACCOUNT)
     ap.add_argument("--out", default="data")
     ap.add_argument("--cookie-file", default=".eversource_cookies.txt", help="Netscape cookie jar to read/write")
     ap.add_argument("--cookieinfo", default="cookieinfo.txt", help="Safari/Chrome copied cookie table to convert if cookie jar is absent")

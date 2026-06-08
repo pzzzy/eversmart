@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 import urllib.error
+import io
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,6 +10,7 @@ from cookie_convert import parse_cookieinfo
 from dashboard import build_dashboard_data
 from eversmart import (
     EversourceClient,
+    collect_once,
     iter_bill_segments,
     iter_pricing_components,
     iter_stream_reads,
@@ -49,13 +51,13 @@ class EversmartParserTests(unittest.TestCase):
         window.addEventListener('opower:unauthorized', function (event) {{
           var authorization = {{ accessToken: '{future_token}' }};
         }});
-        window.opowerApi.setEntityIds(['ENTITY-TEST']);
+        window.opowerApi.setEntityIds(['74005127621']);
         </script>
         """
         with patch.object(client, "request", return_value=html.encode()):
             client.load_databrowser()
         self.assertEqual(client.access_token, future_token)
-        self.assertEqual(client.entity_id, "ENTITY-TEST")
+        self.assertEqual(client.entity_id, "74005127621")
 
     def test_load_databrowser_replaces_expired_embedded_token(self):
         client = EversourceClient(cookie_file=Path("/tmp/no-such-cookie-file"), cookieinfo=Path("/tmp/no-such-cookieinfo"))
@@ -63,14 +65,22 @@ class EversmartParserTests(unittest.TestCase):
         html = f"""
         <script>
           var authorization = {{ accessToken: '{expired_token}' }};
-          window.opowerApi.setEntityIds(['ENTITY-TEST']);
+          window.opowerApi.setEntityIds(['74005127621']);
         </script>
         """
         client.obtain_fresh_opower_token = lambda force_login=False: setattr(client, "access_token", "fresh-token") or "fresh-token"
         with patch.object(client, "request", return_value=html.encode()):
             client.load_databrowser()
         self.assertEqual(client.access_token, "fresh-token")
-        self.assertEqual(client.entity_id, "ENTITY-TEST")
+        self.assertEqual(client.entity_id, "74005127621")
+
+    def test_load_databrowser_mints_token_when_authenticated_shell_has_no_embedded_token(self):
+        client = EversourceClient(cookie_file=Path("/tmp/no-such-cookie-file"), cookieinfo=Path("/tmp/no-such-cookieinfo"))
+        client.obtain_fresh_opower_token = lambda force_login=True: setattr(client, "access_token", "fresh-token") or "fresh-token"
+        with patch.object(client, "request", return_value=b"<html><body>authenticated app shell</body></html>"):
+            html = client.load_databrowser()
+        self.assertIn("authenticated app shell", html)
+        self.assertEqual(client.access_token, "fresh-token")
 
     def test_obtain_fresh_opower_token_uses_okta_session_redirect(self):
         client = EversourceClient(cookie_file=Path("/tmp/no-such-cookie-file"), cookieinfo=Path("/tmp/no-such-cookieinfo"))
@@ -99,13 +109,13 @@ class EversmartParserTests(unittest.TestCase):
         client = EversourceClient(cookie_file=Path("/tmp/no-such-cookie-file"), cookieinfo=Path("/tmp/no-such-cookieinfo"))
         metadata = {
             "data": {"billingAccountByAuthContext": {
-                "utilityId": "ENTITY-TEST",
+                "utilityId": "74005127621",
                 "urn": "acct-urn",
                 "serviceAgreementsConnection": {"edges": [{"node": {
                     "uuid": "sa-1",
                     "availableBillSegmentsInterval": "bill-start/bill-end",
                     "servicePointsConnection": {"edges": [{"node": {
-                        "uuid": "sp-1", "utilityId": "ACCOUNT-TEST",
+                        "uuid": "sp-1", "utilityId": "0061362115-51545561",
                         "premise": {"timeZone": "America/New_York", "uuid": "prem-1", "urn": "prem-urn"},
                         "registers": [
                             {"serviceQuantityIdentifier": "DELIVERED", "availableReadsTimeInterval": "x/y", "readResolution": "QUARTER_HOUR"},
@@ -115,14 +125,60 @@ class EversmartParserTests(unittest.TestCase):
                 }}]},
             }}
         }
-        target = client.find_target(metadata, "ACCOUNT-TEST")
+        target = client.find_target(metadata, "0061362115-51545561")
         self.assertEqual(target.service_agreement_uuid, "sa-1")
         self.assertEqual(target.service_point_uuid, "sp-1")
         self.assertEqual(target.available_interval, "a/b")
-        self.assertEqual(target.entity_id, "ENTITY-TEST")
+        self.assertEqual(target.entity_id, "74005127621")
         self.assertEqual(target.billing_account_urn, "acct-urn")
         self.assertEqual(target.premise_uuid, "prem-1")
         self.assertEqual(target.available_bill_interval, "bill-start/bill-end")
+
+    def test_graphql_retries_transient_502_before_failing(self):
+        client = EversourceClient(cookie_file=Path("/tmp/no-such-cookie-file"), cookieinfo=Path("/tmp/no-such-cookieinfo"))
+        client.access_token = "token"
+        client.entity_id = "entity"
+        attempts = []
+
+        def fake_request(url, body, headers):
+            attempts.append(headers.get("Opower-Selected-Entities"))
+            if len(attempts) == 1:
+                raise urllib.error.HTTPError(url, 502, "Bad Gateway", {}, io.BytesIO(b"Bad Gateway"))
+            return b'{"data":{"ok":true}}'
+
+        client.request = fake_request
+        client._sleep = lambda seconds: None
+        self.assertEqual(client.graphql("query { ok }", {}), {"data": {"ok": True}})
+        self.assertEqual(len(attempts), 2)
+
+    def test_collect_once_does_not_mark_noncritical_rate_plan_502_as_error(self):
+        from eversmart import Target
+        target = Target(
+            account="acct", entity_id="entity", service_agreement_uuid="sa", service_point_uuid="sp",
+            available_interval="2026-01-01T00:00:00-05:00/2026-01-02T00:00:00-05:00", resolution="DAY",
+            timezone="America/New_York", billing_account_urn="urn", billing_account_uuid="ba",
+            service_agreement_urn="saurn", premise_uuid="premise", premise_urn="purn",
+            available_bill_interval="2026-01-01T00:00:00-05:00/2026-01-02T00:00:00-05:00",
+            rate_plan_code="R1",
+        )
+
+        class FakeClient:
+            def metadata(self): return {"data": {"billingAccountByAuthContext": {}}}
+            def service_points(self, metadata): return [target]
+            def usage(self, *args): return {"data": {"billingAccountByAuthContext": {"serviceAgreementsConnection": {"edges": []}}}}
+            cost = usage
+            pricing = usage
+            demand_maxima = usage
+            weather = usage
+            bills = usage
+            def forecast(self, *args): raise RuntimeError("optional forecast failure")
+            def rate_static_content(self, *args):
+                raise RuntimeError("Opower GraphQL HTTP 502: Bad Gateway")
+
+        with tempfile.TemporaryDirectory() as td:
+            manifest = collect_once(FakeClient(), Path(td), "acct", None, None)
+        self.assertEqual(manifest["errors"], {})
+        self.assertIn("rate_plan", manifest["warnings"])
 
     def test_iter_stream_reads_flattens_stream_values(self):
         doc = {"data": {"billingAccountByAuthContext": {"serviceAgreementsConnection": {"edges": [{"node": {
