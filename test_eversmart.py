@@ -327,6 +327,14 @@ class DashboardSummaryTests(unittest.TestCase):
             self.assertEqual(data["warnings"][0]["warnings"], {"bill_forecast": "DataFetchingException"})
             self.assertIsNone(data["latest"]["error"])
 
+    def test_price_chart_keeps_canonical_series_separate_with_optional_benchmark_overlays(self):
+        html = __import__("dashboard").HTML_TEMPLATE
+        self.assertIn("priceFilters", html)
+        self.assertIn("priceOverlayDefs", html)
+        self.assertIn("default:false", html)
+        self.assertIn("buildPriceSeries", html)
+        self.assertNotIn("historical_price_series.filter(x=>x.price_per_kwh!=null).concat(eia)", html)
+
     def test_dashboard_template_uses_global_tooltips_time_aware_x_labels_and_peak_heatmap(self):
         html = __import__("dashboard").HTML_TEMPLATE
         self.assertIn("data-tip-id", html)
