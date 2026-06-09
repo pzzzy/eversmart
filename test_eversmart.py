@@ -383,6 +383,13 @@ class DashboardSummaryTests(unittest.TestCase):
             self.assertEqual(data["warnings"][0]["warnings"], {"bill_forecast": "DataFetchingException"})
             self.assertIsNone(data["latest"]["error"])
 
+    def test_usage_chart_has_matching_daily_hourly_granularity_controls(self):
+        html = __import__("dashboard").HTML_TEMPLATE
+        self.assertIn("usageGranularity", html)
+        self.assertIn("dailyUsageRows", html)
+        self.assertIn("hourlyUsageRows", html)
+        self.assertIn("data-usage-granularity", html)
+
     def test_hourly_cost_series_and_cost_chart_granularity_controls(self):
         with tempfile.TemporaryDirectory() as td:
             run = Path(td) / "20260607T000000Z"
