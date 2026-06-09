@@ -383,6 +383,39 @@ class DashboardSummaryTests(unittest.TestCase):
             self.assertEqual(data["warnings"][0]["warnings"], {"bill_forecast": "DataFetchingException"})
             self.assertIsNone(data["latest"]["error"])
 
+    def test_hourly_cost_series_and_cost_chart_granularity_controls(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = Path(td) / "20260607T000000Z"
+            run.mkdir()
+            (run / "manifest.json").write_text(json.dumps({"retrieved_at_utc": "20260607T000000Z", "account": "006", "resolution": "QUARTER_HOUR", "timezone": "America/New_York"}))
+            (run / "usage.csv").write_text("utility_id,stream,serviceQuantityIdentifier,unit,timeInterval,readType,value,monetaryAmount,isPeakPeriod,service_agreement_uuid,service_point_uuid\n006,netUsage,NET_USAGE,KWH,2026-06-03T00:00/2026-06-03T00:15,ACTUAL,1.0,,false,sa,sp\n006,netUsage,NET_USAGE,KWH,2026-06-03T00:15/2026-06-03T00:30,ACTUAL,2.0,,false,sa,sp\n")
+            (run / "cost.csv").write_text("utility_id,stream,serviceQuantityIdentifier,unit,timeInterval,readType,value,monetaryAmount,isPeakPeriod,service_agreement_uuid,service_point_uuid\n006,netUsage,NET_USAGE,KWH,2026-06-03T00:00/2026-06-03T00:15,ACTUAL,1.0,0.30,false,sa,sp\n006,netUsage,NET_USAGE,KWH,2026-06-03T00:15/2026-06-03T00:30,ACTUAL,2.0,0.60,false,sa,sp\n")
+            data = build_dashboard_data(Path(td))
+            self.assertEqual(data["latest"]["hourly"][0]["hour"], "2026-06-03T00:00")
+            self.assertAlmostEqual(data["latest"]["hourly"][0]["cost"], 0.9)
+            html = __import__("dashboard").HTML_TEMPLATE
+            self.assertIn("costGranularity", html)
+            self.assertIn("dailyCostRows", html)
+            self.assertIn("hourlyCostRows", html)
+
+    def test_peak_demand_events_include_duration_and_estimated_spike_cost(self):
+        with tempfile.TemporaryDirectory() as td:
+            run = Path(td) / "20260607T000000Z"
+            run.mkdir()
+            (run / "manifest.json").write_text(json.dumps({"retrieved_at_utc": "20260607T000000Z", "account": "006", "resolution": "QUARTER_HOUR", "timezone": "America/New_York"}))
+            (run / "usage.csv").write_text("utility_id,stream,serviceQuantityIdentifier,unit,timeInterval,readType,value,monetaryAmount,isPeakPeriod,service_agreement_uuid,service_point_uuid\n006,netUsage,NET_USAGE,KWH,2026-06-03T18:00/2026-06-03T18:15,ACTUAL,0.4,,false,sa,sp\n006,demand,DELIVERED,KW,2026-06-03T18:00/2026-06-03T18:15,ACTUAL,4.0,,false,sa,sp\n")
+            (run / "cost.csv").write_text("utility_id,stream,serviceQuantityIdentifier,unit,timeInterval,readType,value,monetaryAmount,isPeakPeriod,service_agreement_uuid,service_point_uuid\n006,netUsage,NET_USAGE,KWH,2026-06-03T18:00/2026-06-03T18:15,ACTUAL,0.4,0.134504,false,sa,sp\n")
+            (run / "pricing.csv").write_text("utility_id,service_point_uuid,timeInterval,stream,serviceQuantityIdentifier,unit,readType,value,monetaryAmount,cost_per_unit,rate_type,tier,tou_label,component_attributes\n006,sp,2026-06-03T18:00/2026-06-03T18:15,netUsage,NET_USAGE,KWH,ACTUAL,0.4,0.134504,0.33626,FLAT,,,,\n")
+            data = build_dashboard_data(Path(td))
+            event = data["latest"]["peak_demand_events"][0]
+            self.assertEqual(event["duration_minutes"], 15)
+            self.assertEqual(event["duration_label"], "15 min")
+            self.assertAlmostEqual(event["estimated_kwh_at_peak"], 1.0)
+            self.assertAlmostEqual(event["estimated_cost_at_peak"], 0.33626)
+            html = __import__("dashboard").HTML_TEMPLATE
+            self.assertIn("duration_label", html)
+            self.assertIn("estimated_cost_at_peak", html)
+
     def test_price_chart_keeps_canonical_series_separate_with_optional_benchmark_overlays(self):
         html = __import__("dashboard").HTML_TEMPLATE
         self.assertIn("priceFilters", html)
