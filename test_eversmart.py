@@ -115,7 +115,7 @@ class EversmartParserTests(unittest.TestCase):
                     "uuid": "sa-1",
                     "availableBillSegmentsInterval": "bill-start/bill-end",
                     "servicePointsConnection": {"edges": [{"node": {
-                        "uuid": "sp-1", "utilityId": "0061362115-51545561",
+                        "uuid": "sp-1", "utilityId": "ACCOUNT-TEST",
                         "premise": {"timeZone": "America/New_York", "uuid": "prem-1", "urn": "prem-urn"},
                         "registers": [
                             {"serviceQuantityIdentifier": "DELIVERED", "availableReadsTimeInterval": "x/y", "readResolution": "QUARTER_HOUR"},
@@ -125,7 +125,7 @@ class EversmartParserTests(unittest.TestCase):
                 }}]},
             }}
         }
-        target = client.find_target(metadata, "0061362115-51545561")
+        target = client.find_target(metadata, "ACCOUNT-TEST")
         self.assertEqual(target.service_agreement_uuid, "sa-1")
         self.assertEqual(target.service_point_uuid, "sp-1")
         self.assertEqual(target.available_interval, "a/b")
@@ -382,6 +382,50 @@ class DashboardSummaryTests(unittest.TestCase):
             self.assertEqual(data["errors"], [])
             self.assertEqual(data["warnings"][0]["warnings"], {"bill_forecast": "DataFetchingException"})
             self.assertIsNone(data["latest"]["error"])
+
+    def test_advanced_analytics_include_projection_diff_profiles_anomalies_baseload_and_savings(self):
+        with tempfile.TemporaryDirectory() as td:
+            prev = Path(td) / "20260607T000000Z"
+            latest_run = Path(td) / "20260608T000000Z"
+            prev.mkdir(); latest_run.mkdir()
+            manifest = {"account": "006", "resolution": "QUARTER_HOUR", "timezone": "America/New_York", "retrieved_at_utc": "STAMP"}
+            for run, stamp, rows in [
+                (prev, "20260607T000000Z", [
+                    ("2026-06-01T00:00/2026-06-01T00:15", 0.2, 0.067252, 0.8),
+                ]),
+                (latest_run, "20260608T000000Z", [
+                    ("2026-06-01T00:00/2026-06-01T00:15", 0.2, 0.067252, 0.8),
+                    ("2026-06-01T01:00/2026-06-01T01:15", 0.2, 0.067252, 0.7),
+                    ("2026-06-02T18:00/2026-06-02T18:15", 5.0, 1.6813, 6.0),
+                ]),
+            ]:
+                m = dict(manifest, retrieved_at_utc=stamp)
+                (run / "manifest.json").write_text(json.dumps(m))
+                usage_lines = ["utility_id,stream,serviceQuantityIdentifier,unit,timeInterval,readType,value,monetaryAmount,isPeakPeriod,service_agreement_uuid,service_point_uuid"]
+                cost_lines = ["utility_id,stream,serviceQuantityIdentifier,unit,timeInterval,readType,value,monetaryAmount,isPeakPeriod,service_agreement_uuid,service_point_uuid"]
+                pricing_lines = ["utility_id,service_point_uuid,timeInterval,stream,serviceQuantityIdentifier,unit,readType,value,monetaryAmount,cost_per_unit,rate_type,tier,tou_label,component_attributes"]
+                for interval, kwh, cost, kw in rows:
+                    usage_lines.append(f"006,netUsage,NET_USAGE,KWH,{interval},ACTUAL,{kwh},,false,sa,sp")
+                    usage_lines.append(f"006,demand,DELIVERED,KW,{interval},ACTUAL,{kw},,false,sa,sp")
+                    cost_lines.append(f"006,netUsage,NET_USAGE,KWH,{interval},ACTUAL,{kwh},{cost},false,sa,sp")
+                    pricing_lines.append(f"006,sp,{interval},netUsage,NET_USAGE,KWH,ACTUAL,{kwh},{cost},0.33626,FLAT,,,,")
+                (run / "usage.csv").write_text("\n".join(usage_lines) + "\n")
+                (run / "cost.csv").write_text("\n".join(cost_lines) + "\n")
+                (run / "pricing.csv").write_text("\n".join(pricing_lines) + "\n")
+                (run / "weather.csv").write_text("premise_uuid,timeInterval,date,min_temperature,mean_temperature,max_temperature\nprem,2026-06-01/2026-06-02,2026-06-01,60,70,80\nprem,2026-06-02/2026-06-03,2026-06-02,70,85,95\n")
+                (run / "bills.csv").write_text("bill_urn,segment_urn,timeInterval,usageInterval,service_agreement_uuid,serviceType,estimated,kwh,usageCharges,currentAmount,effective_price_per_kwh\nbill,seg,2026-05-01/2026-06-01,2026-05-01/2026-06-01,sa,ELECTRICITY,False,300,100,110,0.366\n")
+            data = build_dashboard_data(Path(td))
+            latest = data["latest"]
+            self.assertGreater(latest["bill_projection"]["projected_cost"], latest["total_cost"])
+            self.assertEqual(data["run_diff"]["new_usage_rows"], latest["usage_rows"] - data["runs"][-2]["usage_rows"])
+            self.assertIn(18, {r["hour_of_day"] for r in data["hourly_profile"]})
+            self.assertIsNotNone(latest["weather_sensitivity"]["correlation"])
+            self.assertTrue(latest["anomalies"]["intervals"])
+            self.assertGreater(latest["baseload"]["estimated_kw"], 0)
+            self.assertGreater(latest["savings_simulator"]["reduce_daily_10pct"]["monthly_savings"], 0)
+            html = __import__("dashboard").HTML_TEMPLATE
+            for token in ("billProjection", "runDiff", "hourlyProfileChart", "weatherSensitivityChart", "anomalyTable", "baseloadCard", "savingsSimulator"):
+                self.assertIn(token, html)
 
     def test_usage_chart_has_matching_daily_hourly_granularity_controls(self):
         html = __import__("dashboard").HTML_TEMPLATE

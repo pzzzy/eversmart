@@ -182,6 +182,132 @@ def _round_money(value: float) -> float:
     return round(value + 0.0000000001, 6)
 
 
+def _pearson(xs: list[float], ys: list[float]) -> float | None:
+    if len(xs) < 2 or len(xs) != len(ys):
+        return None
+    mx = sum(xs) / len(xs)
+    my = sum(ys) / len(ys)
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    dx = sum((x - mx) ** 2 for x in xs) ** 0.5
+    dy = sum((y - my) ** 2 for y in ys) ** 0.5
+    return num / (dx * dy) if dx and dy else None
+
+
+def _bill_projection(daily: list[dict[str, Any]], bill_history: list[dict[str, Any]], total_kwh: float, total_cost: float) -> dict[str, Any]:
+    observed_days = len([d for d in daily if d.get("date") != "unknown"]) or len(daily) or 1
+    billing_days = next((b.get("billing_days") for b in reversed(bill_history) if b.get("billing_days")), 30) or 30
+    avg_daily_kwh = total_kwh / observed_days
+    avg_daily_cost = total_cost / observed_days
+    return {
+        "observed_days": observed_days,
+        "billing_days": billing_days,
+        "days_remaining": max(0, billing_days - observed_days),
+        "avg_daily_kwh": avg_daily_kwh,
+        "avg_daily_cost": avg_daily_cost,
+        "projected_kwh": avg_daily_kwh * billing_days,
+        "projected_cost": avg_daily_cost * billing_days,
+        "remaining_cost": max(0.0, avg_daily_cost * (billing_days - observed_days)),
+    }
+
+
+def _weather_sensitivity(daily: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = [d for d in daily if d.get("mean_temperature") is not None and d.get("net_kwh") is not None]
+    temps = [float(d["mean_temperature"]) for d in rows]
+    kwhs = [float(d["net_kwh"]) for d in rows]
+    corr = _pearson(temps, kwhs)
+    mild = [d for d in rows if 55 <= float(d["mean_temperature"]) <= 70]
+    baseline = (sum(float(d["net_kwh"]) for d in mild) / len(mild)) if mild else ((sum(kwhs) / len(kwhs)) if kwhs else None)
+    points = [{"date": d.get("date"), "mean_temperature": d.get("mean_temperature"), "net_kwh": d.get("net_kwh"), "cost": d.get("cost")} for d in rows]
+    return {"correlation": corr, "baseline_kwh": baseline, "points": points}
+
+
+def _hourly_profile(hourly: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[int, dict[str, Any]] = defaultdict(lambda: {"count": 0, "kwh": 0.0, "cost": 0.0, "peak_kw": 0.0})
+    for row in hourly:
+        hour_s = str(row.get("hour") or "")
+        try:
+            hod = int(hour_s[11:13])
+        except ValueError:
+            continue
+        b = buckets[hod]
+        b["count"] += 1
+        b["kwh"] += float(row.get("net_kwh") or 0.0)
+        b["cost"] += float(row.get("cost") or 0.0)
+        b["peak_kw"] = max(b["peak_kw"], float(row.get("peak_kw") or 0.0))
+    return [{"hour_of_day": h, "count": b["count"], "avg_kwh": b["kwh"] / b["count"], "avg_cost": b["cost"] / b["count"], "peak_kw": b["peak_kw"]} for h, b in sorted(buckets.items()) if b["count"]]
+
+
+def _anomalies(series: list[dict[str, Any]], daily: list[dict[str, Any]]) -> dict[str, Any]:
+    vals = [float(r.get("kwh") or 0.0) for r in series if r.get("kwh") is not None]
+    kws = [float(r.get("kw") or 0.0) for r in series if r.get("kw") is not None]
+    def threshold(values: list[float]) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        med = ordered[len(ordered)//2]
+        mean = sum(values) / len(values)
+        std = (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5
+        return max(med * 3, mean + std)
+    kwh_thr = threshold(vals)
+    kw_thr = threshold(kws)
+    interval_hits = []
+    for r in series:
+        kwh = float(r.get("kwh") or 0.0)
+        kw = float(r.get("kw") or 0.0)
+        if (kwh_thr and kwh >= kwh_thr and kwh > 0) or (kw_thr and kw >= kw_thr and kw > 0):
+            interval_hits.append({"t": r.get("t"), "interval": r.get("interval"), "kwh": kwh, "kw": kw, "cost": r.get("cost"), "reason": "high usage/demand"})
+    day_vals = [float(d.get("net_kwh") or 0.0) for d in daily]
+    day_thr = threshold(day_vals)
+    day_hits = [{"date": d.get("date"), "net_kwh": d.get("net_kwh"), "cost": d.get("cost"), "reason": "high daily use"} for d in daily if day_thr and float(d.get("net_kwh") or 0.0) >= day_thr]
+    return {"interval_threshold_kwh": kwh_thr, "interval_threshold_kw": kw_thr, "intervals": interval_hits[:20], "days": day_hits[:10]}
+
+
+def _baseload(hourly: list[dict[str, Any]], effective_price: float | None) -> dict[str, Any]:
+    overnight = []
+    for row in hourly:
+        hour_s = str(row.get("hour") or "")
+        try:
+            hod = int(hour_s[11:13])
+        except ValueError:
+            continue
+        if 0 <= hod <= 5:
+            overnight.append(float(row.get("peak_kw") or row.get("net_kwh") or 0.0))
+    positive = [v for v in overnight if v > 0]
+    estimated_kw = min(positive) if positive else 0.0
+    daily_kwh = estimated_kw * 24
+    monthly_kwh = daily_kwh * 30
+    price = effective_price or 0.0
+    return {"estimated_kw": estimated_kw, "daily_kwh": daily_kwh, "monthly_kwh": monthly_kwh, "monthly_cost": monthly_kwh * price, "sample_count": len(positive)}
+
+
+def _savings_simulator(total_kwh: float, total_cost: float, avg_daily_kwh: float, avg_daily_cost: float, baseload: dict[str, Any], effective_price: float | None) -> dict[str, Any]:
+    price = effective_price or ((total_cost / total_kwh) if total_kwh else 0.0)
+    return {
+        "reduce_daily_10pct": {"monthly_kwh_saved": avg_daily_kwh * 0.10 * 30, "monthly_savings": avg_daily_cost * 0.10 * 30},
+        "cut_baseload_100w": {"monthly_kwh_saved": 0.1 * 24 * 30, "monthly_savings": 0.1 * 24 * 30 * price},
+        "cut_baseload_25pct": {"monthly_kwh_saved": float(baseload.get("monthly_kwh") or 0.0) * 0.25, "monthly_savings": float(baseload.get("monthly_cost") or 0.0) * 0.25},
+        "reduce_peak_events_15min": {"monthly_kwh_saved": 1.0 * 0.25 * 4, "monthly_savings": 1.0 * 0.25 * 4 * price},
+    }
+
+
+def _run_diff(runs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if len(runs) < 2:
+        return None
+    prev, cur = runs[-2], runs[-1]
+    prev_end = _parse_interval_datetime(prev.get("latest_available_end") or "")
+    cur_end = _parse_interval_datetime(cur.get("latest_available_end") or "")
+    advanced_hours = ((cur_end - prev_end).total_seconds() / 3600) if prev_end and cur_end else None
+    return {
+        "previous_retrieved_at_utc": prev.get("retrieved_at_utc"),
+        "latest_retrieved_at_utc": cur.get("retrieved_at_utc"),
+        "new_usage_rows": (cur.get("usage_rows") or 0) - (prev.get("usage_rows") or 0),
+        "new_cost_rows": (cur.get("cost_rows") or 0) - (prev.get("cost_rows") or 0),
+        "kwh_delta": (cur.get("total_net_kwh") or 0.0) - (prev.get("total_net_kwh") or 0.0),
+        "cost_delta": (cur.get("total_cost") or 0.0) - (prev.get("total_cost") or 0.0),
+        "advanced_hours": advanced_hours,
+    }
+
+
 OPTIONAL_ERROR_KEYS = {"bill_forecast"}
 
 
@@ -470,6 +596,11 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
     peak_demand_events.sort(key=lambda x: x["kw"], reverse=True)
 
     price_source = "rated_components" if pricing_by_interval else "cost_div_kwh"
+    bill_projection = _bill_projection(daily, bill_history, total_net_kwh, total_cost)
+    weather_sensitivity = _weather_sensitivity(daily)
+    baseload = _baseload(hourly_rows, effective_price)
+    anomalies = _anomalies(series, daily)
+    savings_simulator = _savings_simulator(total_net_kwh, total_cost, avg_daily_use, avg_daily_cost, baseload, effective_price)
     green_button = manifest.get("green_button") or {"row_count": len(green_button_rows)}
     if "row_count" not in green_button:
         green_button["row_count"] = len(green_button_rows)
@@ -505,6 +636,11 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "cost_sources": dict(sorted(cost_sources.items())),
         "weather": weather,
         "bill_history": bill_history,
+        "bill_projection": bill_projection,
+        "weather_sensitivity": weather_sensitivity,
+        "baseload": baseload,
+        "anomalies": anomalies,
+        "savings_simulator": savings_simulator,
         "peak_demand_events": peak_demand_events[:20],
         "green_button": green_button,
         "service_points": service_point_rows or manifest.get("service_points", []),
@@ -604,6 +740,8 @@ def build_dashboard_data(data_dir: Path = Path("data")) -> dict[str, Any]:
         "errors": errors,
         "warnings": warnings,
         "price_benchmarks": benchmarks,
+        "run_diff": _run_diff(runs),
+        "hourly_profile": _hourly_profile(latest.get("hourly") or []) if latest else [],
         **aggregates,
     }
 
@@ -647,7 +785,7 @@ function hideTip(){tip.style.display='none'}
 function showRunTip(run,evt){let lines=[`<span class="tip-title">${esc(run.retrieved_label)}</span>`,`${run.usage_rows} usage rows · ${run.cost_rows} cost rows`,`${fmt(run.total_net_kwh,3)} kWh · ${money(run.total_cost)}`,`$/kWh ${rate(run.effective_price_per_kwh)} · peak ${fmt(run.peak_kw,3)} kW`,run.error?'ERROR: '+JSON.stringify(run.error):(run.warnings?'optional: '+Object.keys(run.warnings).join(', '):'ok')];showTip(lines.join('\n'),evt.clientX,evt.clientY)}
 function timeLabel(s){if(!s)return 'unknown'; try{return new Date(s).toLocaleString()}catch{return s}}
 function shortDateLabel(s){if(!s)return '';let d=new Date(s);if(Number.isNaN(d.getTime()))return String(s).slice(0,10);return d.toLocaleDateString(undefined,{month:'short',day:'numeric'})}
-function xLabelFor(row,opt={}){if(row?.hour)return opt.timeLabels==='date'?String(row.hour).slice(5,10):String(row.hour).slice(5,16).replace('T',' ');if(opt.timeLabels&&row?.t){let d=new Date(row.t);if(!Number.isNaN(d.getTime()))return opt.timeLabels==='hour'?d.toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'}):d.toLocaleDateString(undefined,{month:'short',day:'numeric'})}return row?.date||shortDateLabel(row?.t)||row?.period_label||(row?.interval||row?.timeInterval||'').split('/')[0].slice(0,10)}
+function xLabelFor(row,opt={}){if(row?.hour_of_day!=null)return String(row.hour_of_day).padStart(2,'0')+':00';if(row?.hour)return opt.timeLabels==='date'?String(row.hour).slice(5,10):String(row.hour).slice(5,16).replace('T',' ');if(opt.timeLabels&&row?.t){let d=new Date(row.t);if(!Number.isNaN(d.getTime()))return opt.timeLabels==='hour'?d.toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'}):d.toLocaleDateString(undefined,{month:'short',day:'numeric'})}return row?.date||shortDateLabel(row?.t)||row?.period_label||(row?.interval||row?.timeInterval||'').split('/')[0].slice(0,10)}
 function finiteOrNull(raw){if(raw==null||raw==='')return null;let v=+raw;return Number.isFinite(v)?v:null}
 function drawXAxisLabels(ctx,items,xFor,y,opt={}){let n=items.length;if(!n)return;let maxTicks=opt.maxTicks||6,step=Math.max(1,Math.ceil(n/maxTicks));ctx.save();ctx.fillStyle='rgba(208,214,224,.72)';ctx.strokeStyle='rgba(255,255,255,.10)';ctx.font='11px ui-monospace';ctx.textAlign='center';ctx.textBaseline='top';for(let i=0;i<n;i+=step){let label=xLabelFor(items[i],opt);if(!label)continue;let x=xFor(i);ctx.beginPath();ctx.moveTo(x,y-8);ctx.lineTo(x,y-3);ctx.stroke();ctx.fillText(label,x,y)}if(n>1&&(n-1)%step!==0){let label=xLabelFor(items[n-1],opt);let x=xFor(n-1);ctx.beginPath();ctx.moveTo(x,y-8);ctx.lineTo(x,y-3);ctx.stroke();ctx.fillText(label,x,y)}ctx.restore()}
 function lineChart(canvas,series,defs,opt={}){const ctx=canvas.getContext('2d'),dpr=devicePixelRatio||1,rect=canvas.getBoundingClientRect();canvas.width=rect.width*dpr;canvas.height=rect.height*dpr;ctx.scale(dpr,dpr);const W=rect.width,H=rect.height,pt=34,pb=56,pl=42,rp=opt.rightAxis?46:42,plotH=H-pt-pb;ctx.clearRect(0,0,W,H);const xFor=i=>pl+(W-pl-rp)*(series.length<=1?0:i/(series.length-1));ctx.strokeStyle='rgba(255,255,255,.07)';ctx.lineWidth=1;for(let i=0;i<5;i++){let y=pt+plotH*i/4;ctx.beginPath();ctx.moveTo(pl,y);ctx.lineTo(W-rp,y);ctx.stroke()}const domain=axis=>{const vals=[];defs.filter(d=>(d.axis||'left')===axis).forEach(def=>series.forEach(x=>{let v=finiteOrNull(x[def.key]);if(v!=null)vals.push(v)}));if(!vals.length)return {min:0,max:1};let min=Math.min(...vals),max=Math.max(...vals);if(opt.zero!==false&&min>0)min=0;if(min===max){max+=1;min-=1}return {min,max}};const left=domain('left'),right=domain('right');const yFor=(v,axis)=>{const d=(axis||'left')==='right'?right:left;return pt+plotH-plotH*(v-d.min)/(d.max-d.min||1)};defs.forEach(def=>{ctx.beginPath();let started=false;series.forEach((x,i)=>{let raw=x[def.key],v=finiteOrNull(raw);if(v==null){started=false;return;}let xx=xFor(i),yy=yFor(v,def.axis);if(started)ctx.lineTo(xx,yy);else{ctx.moveTo(xx,yy);started=true}});ctx.strokeStyle=def.color;ctx.lineWidth=def.axis==='right'?1.7:2.2;if(def.dash)ctx.setLineDash(def.dash);ctx.stroke();ctx.setLineDash([])});ctx.fillStyle='rgba(208,214,224,.8)';ctx.font='11px ui-monospace';ctx.textAlign='left';ctx.fillText(fmt(left.max,opt.yDigits??2),8,pt+4);ctx.fillText(fmt(left.min,opt.yDigits??2),8,pt+plotH+4);if(opt.rightAxis){ctx.fillStyle='rgba(244,114,182,.85)';ctx.fillText(fmt(right.max,opt.rightDigits??1),W-rp+8,pt+4);ctx.fillText(fmt(right.min,opt.rightDigits??1),W-rp+8,pt+plotH+4)}drawXAxisLabels(ctx,series,xFor,H-pb+18,opt);canvas.onmousemove=e=>{if(!series.length)return;let r=canvas.getBoundingClientRect(),x=e.clientX-r.left,idx=Math.round((x-pl)/(W-pl-rp)*(series.length-1));idx=Math.max(0,Math.min(series.length-1,idx));let row=series[idx];let lines=[`<span class="tip-title">${esc(opt.title||'Reading')}</span>`,`<span class="tip-accent">${esc(timeLabel(row.t))}</span>`,esc(row.interval||row.period_label||'')];defs.forEach(def=>{let v=row[def.key];if(v!=null)lines.push(`${def.label}: ${def.format?def.format(v):fmt(v,3)}`)});if(row.price_per_kwh!=null)lines.push(`Effective price: ${rate(row.price_per_kwh)}`);if(row.mean_temperature!=null)lines.push(`Temp: ${fmt(row.mean_temperature,1)}°F mean (${fmt(row.min_temperature,1)}–${fmt(row.max_temperature,1)}°F)`);if(row.readType)lines.push(`Read type: ${esc(row.readType)}`);showTip(lines.join('\n'),e.clientX,e.clientY)};canvas.onmouseleave=hideTip}
@@ -659,6 +797,12 @@ ${metric('Net usage',fmt(latest.total_net_kwh,3)+' kWh','Current available inter
 <section class="card pad wide"><div class="section-title"><h2>Quarter-hour profile</h2><span>independent toggles; temperature uses right axis</span></div><div class="filters" id="qhFilters"></div><canvas id="usageChart"></canvas><div class="legend" id="qhLegend"></div></section>
 <section class="card pad side"><div class="section-title"><h2>Coverage and run health</h2><span>poll history</span></div><div class="timeline">${DASHBOARD_DATA.runs.map(r=>`<div class="bar ${r.error?'err':''}" style="height:${Math.max(8,Math.min(120,(r.usage_rows||1)/(latest.usage_rows||1)*120))}px" data-tip-id="run-${DASHBOARD_DATA.runs.indexOf(r)}"></div>`).join('')}</div><div class="kv" style="margin-top:18px"><div>Last successful poll</div><div>${esc(latest.retrieved_label)}</div><div>AMI available through</div><div class="mono">${esc(latest.latest_available_end||'unknown')}</div><div>Data directory</div><div class="mono">${esc(latest.run_dir)}</div><div>Available interval</div><div class="mono">${esc(latest.available_interval)}</div><div>Requested interval</div><div class="mono">${esc(latest.requested_interval)}</div></div></section>
 <section class="card pad half mini"><div class="section-title"><h2>Usage by period</h2><span id="usageGranularityLabel">daily usage + weather</span></div><div class="filters" id="usageGranularity"><label class="check"><input type="radio" name="usageGranularity" data-usage-granularity="daily" checked>Daily</label><label class="check"><input type="radio" name="usageGranularity" data-usage-granularity="hourly">Hourly</label></div><canvas id="dailyChart"></canvas></section><section class="card pad half mini"><div class="section-title"><h2>Cost by period</h2><span id="costGranularityLabel">daily cost</span></div><div class="filters" id="costGranularity"><label class="check"><input type="radio" name="costGranularity" data-cost-granularity="daily" checked>Daily</label><label class="check"><input type="radio" name="costGranularity" data-cost-granularity="hourly">Hourly</label></div><canvas id="costChart"></canvas></section>
+<section class="card pad half"><div class="section-title"><h2>Bill projection</h2><span id="billProjection">current-cycle forecast</span></div><div class="kv"><div>Observed</div><div>${latest.bill_projection.observed_days} of ${latest.bill_projection.billing_days} days</div><div>Projected usage</div><div>${fmt(latest.bill_projection.projected_kwh,1)} kWh</div><div>Projected cost</div><div>${money(latest.bill_projection.projected_cost)}</div><div>Remaining estimate</div><div>${money(latest.bill_projection.remaining_cost)}</div></div><div class="sub" style="font-size:13px">Projection extrapolates the current returned smart-meter interval across the most recent billing-period length.</div></section>
+<section class="card pad half"><div class="section-title"><h2>What changed since last run?</h2><span id="runDiff">run-to-run diff</span></div><div class="kv"><div>New usage rows</div><div>${DASHBOARD_DATA.run_diff?DASHBOARD_DATA.run_diff.new_usage_rows:'—'}</div><div>New cost rows</div><div>${DASHBOARD_DATA.run_diff?DASHBOARD_DATA.run_diff.new_cost_rows:'—'}</div><div>Usage delta</div><div>${DASHBOARD_DATA.run_diff?fmt(DASHBOARD_DATA.run_diff.kwh_delta,3)+' kWh':'—'}</div><div>Cost delta</div><div>${DASHBOARD_DATA.run_diff?money(DASHBOARD_DATA.run_diff.cost_delta):'—'}</div><div>Meter advanced</div><div>${DASHBOARD_DATA.run_diff&&DASHBOARD_DATA.run_diff.advanced_hours!=null?fmt(DASHBOARD_DATA.run_diff.advanced_hours,1)+' hours':'—'}</div></div></section>
+<section class="card pad half mini"><div class="section-title"><h2>Average usage by hour</h2><span>typical daily shape</span></div><canvas id="hourlyProfileChart"></canvas></section>
+<section class="card pad half mini"><div class="section-title"><h2>Weather sensitivity</h2><span>kWh vs temperature</span></div><canvas id="weatherSensitivityChart"></canvas><div class="sub" style="font-size:13px">Correlation: ${latest.weather_sensitivity.correlation==null?'—':fmt(latest.weather_sensitivity.correlation,2)} · mild-day baseline ${latest.weather_sensitivity.baseline_kwh==null?'—':fmt(latest.weather_sensitivity.baseline_kwh,2)+' kWh/day'}</div></section>
+<section class="card pad half"><div class="section-title"><h2>Anomaly watch</h2><span id="anomalyTable">high usage/demand outliers</span></div><table class="table"><thead><tr><th>When</th><th>kWh</th><th>Demand</th><th>Cost</th><th>Reason</th></tr></thead><tbody>${(latest.anomalies.intervals||[]).slice(0,8).map(a=>`<tr><td>${esc(timeLabel(a.t))}</td><td>${fmt(a.kwh,3)}</td><td>${fmt(a.kw,3)} kW</td><td>${money(a.cost)}</td><td>${esc(a.reason)}</td></tr>`).join('')||'<tr><td colspan="5" class="ok">No interval anomalies detected.</td></tr>'}</tbody></table></section>
+<section class="card pad half"><div class="section-title"><h2>Baseload + savings simulator</h2><span id="baseloadCard">overnight always-on estimate</span></div><div id="savingsSimulator" class="kv"><div>Estimated baseload</div><div>${fmt(latest.baseload.estimated_kw,3)} kW · ${fmt(latest.baseload.monthly_kwh,1)} kWh/month · ${money(latest.baseload.monthly_cost)}/month</div><div>Reduce daily use 10%</div><div>${money(latest.savings_simulator.reduce_daily_10pct.monthly_savings)}/month</div><div>Cut 100W always-on</div><div>${money(latest.savings_simulator.cut_baseload_100w.monthly_savings)}/month</div><div>Cut baseload 25%</div><div>${money(latest.savings_simulator.cut_baseload_25pct.monthly_savings)}/month</div></div></section>
 <section class="card pad full"><div class="section-title"><h2>Canonical kWh price over time</h2><span>${DASHBOARD_DATA.historical_price_series.length.toLocaleString()} intervals · benchmark overlays are optional</span></div><div class="filters" id="priceFilters"></div><canvas id="priceChart"></canvas><div class="legend" id="priceLegend"></div><div class="sub" style="font-size:13px;margin:6px 0 0">Eversource canonical price is the rated component returned for each interval. It should be flat unless your actual tariff changes. EIA regional/national values are monthly residential averages repeated as optional comparison lines, not additional Eversource interval observations.</div></section>
 <section class="card pad half"><div class="section-title"><h2>Long-term bill trend</h2><span>bills are shown by billing-period end date; table lists covered period</span></div><canvas id="billTrendChart"></canvas><div class="sub" style="font-size:13px;margin:4px 0 10px">Lines compare billed kWh, usage charges, and actual $/kWh for each monthly billing period. Actual $/kWh is total bill amount divided by kWh, not just usage charges. The label is the bill's covered usage interval, not the scraper run time.</div><table class="table"><thead><tr><th>Billing period</th><th>Days</th><th>Usage</th><th>Usage charges</th><th>$/kWh</th><th>Bill amount</th></tr></thead><tbody>${(DASHBOARD_DATA.bill_trend||latest.bill_history||[]).slice().reverse().map(b=>`<tr title="raw interval: ${esc(b.timeInterval||b.usageInterval)}"><td>${esc(b.period_label||b.timeInterval||b.usageInterval)}</td><td>${b.billing_days||'—'}</td><td>${fmt(b.kwh,2)} kWh</td><td>${money(b.usageCharges)}</td><td>${rate(b.effective_price_per_kwh)}</td><td>${money(b.currentAmount)} ${b.estimated?'· estimated':''}</td></tr>`).join('')||'<tr><td colspan="6" class="warn">No bill history rows returned.</td></tr>'}</tbody></table></section>
 <section class="card pad half"><div class="section-title"><h2>Peak demand events</h2><span>top intervals plus time-of-day heatmap</span></div><div id="demandHeatmap"></div><canvas id="demandEventChart"></canvas><table class="table"><thead><tr><th>When</th><th>Duration</th><th>Demand</th><th>Est. spike cost</th><th>Temp</th></tr></thead><tbody>${(DASHBOARD_DATA.demand_event_series||latest.peak_demand_events||[]).slice(0,10).map(p=>`<tr><td>${esc(p.label||timeLabel(p.t))}</td><td>${esc(p.duration_label||'—')}</td><td>${fmt(p.kw,3)} kW</td><td>${money(p.estimated_cost_at_peak)} <span style="color:var(--dim)">(${fmt(p.estimated_kwh_at_peak,3)} kWh @ peak)</span></td><td>${p.mean_temperature!=null?fmt(p.mean_temperature,1)+'°F':'—'}</td></tr>`).join('')||'<tr><td colspan="5" class="warn">No demand intervals returned.</td></tr>'}</tbody></table></section>
@@ -691,7 +835,7 @@ function hourlyCostRows(){return latest.hourly||[]}
 function activeCostRows(){return costGranularity==='hourly'?hourlyCostRows():dailyCostRows()}
 function renderUsageGranularityControls(){document.querySelectorAll('[data-usage-granularity]').forEach(ch=>ch.onchange=()=>{if(ch.checked){usageGranularity=ch.dataset.usageGranularity;$('usageGranularityLabel').textContent=usageGranularity==='hourly'?'hourly usage':'daily usage + weather';drawAll()}})}
 function renderCostGranularityControls(){document.querySelectorAll('[data-cost-granularity]').forEach(ch=>ch.onchange=()=>{if(ch.checked){costGranularity=ch.dataset.costGranularity;$('costGranularityLabel').textContent=costGranularity==='hourly'?'hourly cost':'daily cost';drawAll()}})}
-function drawAll(){drawQuarterHour();barChart($('dailyChart'),activeUsageRows(),'net_kwh','#7170ff',{title:usageGranularity==='hourly'?'Hourly usage':'Daily usage',timeLabels:usageGranularity==='hourly'?'hour':'date',maxTicks:usageGranularity==='hourly'?8:7});barChart($('costChart'),activeCostRows(),'cost','#34d399',{title:costGranularity==='hourly'?'Hourly cost':'Daily cost',timeLabels:costGranularity==='hourly'?'hour':'date',maxTicks:costGranularity==='hourly'?8:7});lineChart($('priceChart'),buildPriceSeries(),selectedPriceDefs(),{title:'Canonical price with optional benchmark overlays',yDigits:3,zero:false,timeLabels:'date'});lineChart($('billTrendChart'),DASHBOARD_DATA.bill_trend||[],[{key:'kwh',label:'Bill kWh',color:'#7170ff',format:v=>fmt(v,1)+' kWh'},{key:'usageCharges',label:'Usage charges',color:'#34d399',format:money},{key:'effective_price_per_kwh',label:'Actual $/kWh',color:'#f472b6',format:rate,axis:'right',dash:[5,5]}],{title:'Bill trend',rightAxis:true,yDigits:1,rightDigits:3,zero:false});renderDemandHeatmap($('demandHeatmap'),(DASHBOARD_DATA.demand_event_series||[]).slice(0,48));lineChart($('demandEventChart'),(DASHBOARD_DATA.demand_event_series||[]).slice(0,30).slice().reverse(),[{key:'kw',label:'Demand',color:'#22d3ee',format:v=>fmt(v,3)+' kW'},{key:'mean_temperature',label:'Mean temp',color:'#f472b6',format:v=>fmt(v,1)+'°F',axis:'right',dash:[5,5]}],{title:'Peak demand events',rightAxis:true,yDigits:3,rightDigits:1})}
+function drawAll(){drawQuarterHour();barChart($('dailyChart'),activeUsageRows(),'net_kwh','#7170ff',{title:usageGranularity==='hourly'?'Hourly usage':'Daily usage',timeLabels:usageGranularity==='hourly'?'hour':'date',maxTicks:usageGranularity==='hourly'?8:7});barChart($('costChart'),activeCostRows(),'cost','#34d399',{title:costGranularity==='hourly'?'Hourly cost':'Daily cost',timeLabels:costGranularity==='hourly'?'hour':'date',maxTicks:costGranularity==='hourly'?8:7});barChart($('hourlyProfileChart'),DASHBOARD_DATA.hourly_profile||[],'avg_kwh','#22d3ee',{title:'Average usage by hour',maxTicks:8});lineChart($('weatherSensitivityChart'),latest.weather_sensitivity.points||[],[{key:'net_kwh',label:'Daily kWh',color:'#7170ff',format:v=>fmt(v,2)+' kWh'},{key:'mean_temperature',label:'Mean temp',color:'#f472b6',format:v=>fmt(v,1)+'°F',axis:'right',dash:[5,5]}],{title:'Weather sensitivity',rightAxis:true,yDigits:2,rightDigits:1});lineChart($('priceChart'),buildPriceSeries(),selectedPriceDefs(),{title:'Canonical price with optional benchmark overlays',yDigits:3,zero:false,timeLabels:'date'});lineChart($('billTrendChart'),DASHBOARD_DATA.bill_trend||[],[{key:'kwh',label:'Bill kWh',color:'#7170ff',format:v=>fmt(v,1)+' kWh'},{key:'usageCharges',label:'Usage charges',color:'#34d399',format:money},{key:'effective_price_per_kwh',label:'Actual $/kWh',color:'#f472b6',format:rate,axis:'right',dash:[5,5]}],{title:'Bill trend',rightAxis:true,yDigits:1,rightDigits:3,zero:false});renderDemandHeatmap($('demandHeatmap'),(DASHBOARD_DATA.demand_event_series||[]).slice(0,48));lineChart($('demandEventChart'),(DASHBOARD_DATA.demand_event_series||[]).slice(0,30).slice().reverse(),[{key:'kw',label:'Demand',color:'#22d3ee',format:v=>fmt(v,3)+' kW'},{key:'mean_temperature',label:'Mean temp',color:'#f472b6',format:v=>fmt(v,1)+'°F',axis:'right',dash:[5,5]}],{title:'Peak demand events',rightAxis:true,yDigits:3,rightDigits:1})}
 renderQhControls();renderPriceControls();renderUsageGranularityControls();renderCostGranularityControls();document.querySelectorAll('[data-tip-id]').forEach(el=>{el.onmousemove=e=>showRunTip(DASHBOARD_DATA.runs[+el.dataset.tipId.split('-')[1]],e);el.onmouseleave=hideTip});drawAll();window.onresize=drawAll;$('footer').textContent=`Static file: refresh after each scraper run · Source data: ${DASHBOARD_DATA.data_dir}`}
 render();
 </script></body></html>'''
