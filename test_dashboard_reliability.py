@@ -525,6 +525,26 @@ class DashboardReliabilityTest(unittest.TestCase):
         status = self.build()["latest"]["status"]
         self.assertEqual(status["latest_actual_net_read_end_utc"], "2026-11-01T04:15:00Z")
 
+    def test_top_cards_use_recent_meter_dates_not_archive_totals(self):
+        old = read(datetime(2026, 10, 1, 6, tzinfo=UTC), 100)
+        outside = read(datetime(2026, 10, 21, 6, tzinfo=UTC), 20)
+        first = read(datetime(2026, 10, 22, 6, tzinfo=UTC), 2)
+        latest = read(datetime(2026, 11, 21, 4, tzinfo=UTC), 3)  # Nov 20 at 11 pm, meter time
+        self.poll("20261122T120000Z", usage=[old, outside, first, latest],
+                  cost=[{**old, "monetaryAmount": 500}, {**outside, "monetaryAmount": 200},
+                        {**first, "monetaryAmount": 0}, {**latest, "monetaryAmount": 4.50}])
+        with patch.object(dashboard, "DAILY_POINTS", 1):
+            summary = self.build()["latest"]
+        self.assertEqual(summary["total_cost"], 704.50)
+        self.assertEqual(summary.get("recent_summary"), {
+            "start_date": "2026-10-22", "end_date": "2026-11-20",
+            "net_kwh": 5, "estimated_cost": 4.50,
+        })
+
+    def test_recent_cost_is_unavailable_without_cost_rows(self):
+        self.poll("20261122T120000Z", usage=[read(datetime(2026, 11, 20, 12, tzinfo=UTC))])
+        self.assertIsNone(self.build()["latest"]["recent_summary"]["estimated_cost"])
+
     def test_private_html_labels_status_and_never_claims_exports_are_safe(self):
         self.poll("20261102T060000Z")
         html = dashboard.generate_dashboard(self.data, self.root / "report.html").read_text()
@@ -560,7 +580,10 @@ class DashboardReliabilityTest(unittest.TestCase):
             assert.match(money(0), /^\\$0[.,]00$/);
             assert.match(timeLabel('2026-11-01T05:00:00Z'), /EDT|GMT-4/);
             assert.match(timeLabel('2026-11-01T06:00:00Z'), /EST|GMT-5/);
-            assert.match(document.getElementById('app').innerHTML, /2026-11-01T07:00:00Z/);
+            const app=document.getElementById('app').innerHTML;
+            assert.match(app, /2026-11-01T07:00:00Z/);
+            assert.ok(app.includes('30-day estimated cost</div><div class="value">—</div>'));
+            assert.match(app, /2026-10-03 to 2026-11-01 · interval estimate, not a bill/);
             """
             run = subprocess.run(["node", "-"], input=harness + "\n".join(scripts) + checks,
                                  text=True, capture_output=True)
