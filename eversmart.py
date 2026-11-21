@@ -29,7 +29,7 @@ from typing import Any, Iterable
 from queries import QUERIES
 from runtime import (
     RETRYABLE_HTTP, LocalError, LockBusy, UpstreamError, atomic_destination, atomic_json,
-    is_transient, make_private_directory, process_lock, retry_delay, safe_error, state_directory,
+    is_transient, make_private_directory, process_lock, require_private_directory, retry_delay, safe_error, state_directory,
 )
 
 EVERSOURCE_DATABROWSER_URL = "https://www.eversource.com/cg/customer/UsageHistory/DataBrowser"
@@ -857,13 +857,85 @@ def write_raw(path: Path, obj: Any) -> None:
     path.chmod(0o600)
 
 
-def _required_usage(client, target: Target, interval: str, resolution: str) -> dict[str, Any]:
-    doc = client.usage(target, interval, resolution)
+def _response_account(doc) -> dict[str, Any]:
     data = doc.get("data") if isinstance(doc, dict) else None
     account = data.get("billingAccountByAuthContext") if isinstance(data, dict) else None
     if not isinstance(account, dict) or doc.get("errors"):
-        raise UpstreamError("Required Opower usage response was incomplete.")
-    return doc
+        raise UpstreamError("Opower returned an incomplete account response.")
+    return account
+
+
+def _response_nodes(parent, connection):
+    container = parent.get(connection)
+    edges = container.get("edges") if isinstance(container, dict) else None
+    if not isinstance(edges, list):
+        raise UpstreamError("Opower returned an incomplete connection.")
+    return [edge["node"] for edge in edges if isinstance(edge, dict) and isinstance(edge.get("node"), dict)]
+
+
+_USAGE_STREAMS = ("netUsage", "energyDelivered", "energyReceived", "demand")
+
+
+def _point_response(doc, target: Target, stream_names: tuple[str, ...]) -> dict[str, Any]:
+    account = _response_account(doc)
+    # Some queries include billing-account IDs; when returned, they must also match.
+    for field, expected in (("uuid", target.billing_account_uuid), ("urn", target.billing_account_urn)):
+        if expected and field in account and account[field] != expected:
+            raise UpstreamError("Opower returned a different billing account.")
+    agreements = _response_nodes(account, "serviceAgreementsConnection")
+    matches = [(sa, sp) for sa in agreements if sa.get("uuid") == target.service_agreement_uuid
+               for sp in _response_nodes(sa, "servicePointsConnection")
+               if sp.get("uuid") == target.service_point_uuid and sp.get("utilityId") == target.account]
+    if len(matches) != 1:
+        raise UpstreamError("Opower did not identify the requested service point unambiguously.")
+    sa, sp = matches[0]
+    streams = sp.get("readStreams")
+    if not isinstance(streams, dict) or not any(name in streams for name in stream_names):
+        raise UpstreamError("Opower omitted the requested read streams.")
+    for name in stream_names:
+        entries = streams.get(name)
+        if entries is None:  # Nullable stream, or this query did not request it.
+            continue
+        if not isinstance(entries, list) or any(
+            not isinstance(entry, dict) or not isinstance(entry.get("reads"), list)
+            or any(not isinstance(read, dict) for read in entry["reads"]) for entry in entries
+        ):
+            raise UpstreamError("Opower returned a malformed read stream.")
+    # Keep the original response for audit; the CSV and history use only the requested node.
+    return {"data": {"billingAccountByAuthContext": {"serviceAgreementsConnection": {"edges": [
+        {"node": {**sa, "servicePointsConnection": {"edges": [{"node": sp}]}}}
+    ]}}}}
+
+
+def _required_usage(client, target: Target, interval: str, resolution: str) -> tuple[dict, list[dict]]:
+    from math import isfinite
+    from history import _parse_window, _zone
+
+    doc = client.usage(target, interval, resolution)
+    scoped = _point_response(doc, target, _USAGE_STREAMS)
+    zone = _zone(target.timezone)
+    rows = []
+    saw_padding = saw_requested = False
+    try:
+        requested_start, requested_end = _parse_window(interval)
+        for row in iter_stream_reads(scoped):
+            start, end = _parse_window(row["timeInterval"], zone)
+            if end <= requested_start or start >= requested_end:
+                # Opower can pad the requested range at either end. Keep the
+                # raw response, but never count those slots toward this poll.
+                saw_padding = True
+                continue
+            saw_requested = True
+            value = row["value"]
+            if value is not None:
+                if isinstance(value, bool) or not isfinite(float(value)):
+                    raise ValueError("invalid measurement")
+                rows.append(row)
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise UpstreamError("Opower returned a malformed usage reading.") from exc
+    if saw_padding and not saw_requested:
+        raise UpstreamError("Opower returned only out-of-window usage readings.")
+    return doc, rows
 
 
 def write_bytes(path: Path, data: bytes) -> None:
@@ -967,7 +1039,7 @@ def publish_dashboard(outdir: Path, output: Path, *, db_path: Path, account: str
     if manual_bill_dir is not None and ("manual_bill_dir" in params or accepts_keywords):
         options["manual_bill_dir"] = manual_bill_dir
     make_private_directory(output.parent)
-    with atomic_destination(output) as staged:
+    with atomic_destination(output, replace=not shareable) as staged:
         renderer(outdir, staged, **options)
         if not staged.stat().st_size:
             raise LocalError("Dashboard renderer did not produce an artifact.")
@@ -975,11 +1047,17 @@ def publish_dashboard(outdir: Path, output: Path, *, db_path: Path, account: str
 
 
 def _history_account(db_path: Path, account: str | None) -> str | None:
-    if account or not db_path.is_file():
-        return account
+    if not db_path.is_file():
+        if account:
+            raise LocalError("No imported history for the selected service point.")
+        return None
     from history import History
 
     with History(db_path) as store:
+        if account:
+            if store.latest_manifest(account) is None:
+                raise LocalError("No imported history for the selected service point.")
+            return account
         accounts = {record.get("account") or record.get("utility_id") for record in store.manifests()}
     accounts.discard(None)
     if len(accounts) > 1:
@@ -987,12 +1065,121 @@ def _history_account(db_path: Path, account: str | None) -> str | None:
     return next(iter(accounts), None)
 
 
+_AUX_DATASETS = ("cost", "pricing", "demand_maxima", "weather")
+_AUX_WINDOWS_PER_DATASET = 4
+_MAX_READ_WINDOW = timedelta(hours=720)
+_ReadWindow = tuple[datetime, datetime]
+_AuxKey = tuple[str, str, str, str, str]
+
+
+def _ledger_window(text) -> _ReadWindow:
+    start, end = map(datetime.fromisoformat, text.split("/"))
+    if start.utcoffset() is None or end.utcoffset() is None or start >= end or end - start > _MAX_READ_WINDOW:
+        raise ValueError("invalid archived auxiliary window")
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
+def _window_text(pair: _ReadWindow) -> str:
+    return "/".join(_format_opower_datetime(t) for t in pair)
+
+
+def _merge_aux_windows(windows: Iterable[_ReadWindow]) -> list[_ReadWindow]:
+    merged: list[_ReadWindow] = []
+    for start, end in sorted(windows):
+        if merged:
+            low, high = merged[-1]
+            if end <= high:
+                continue
+            if start <= high:
+                if end - low <= _MAX_READ_WINDOW:
+                    merged[-1] = low, end
+                    continue
+                # Split on an existing request boundary, not an arbitrary UTC
+                # hour (daily requests can cross a DST transition).
+                start = high
+        merged.append((start, end))
+    return merged
+
+
+def _subtract_aux_windows(windows: list[_ReadWindow], repaired: list[_ReadWindow]) -> list[_ReadWindow]:
+    remaining = []
+    repairs = iter(_merge_aux_windows(repaired))
+    done = next(repairs, None)
+    for start, end in _merge_aux_windows(windows):
+        while done and done[0] < end:
+            if done[0] > start:
+                remaining.append((start, done[0]))
+            start = max(start, done[1])
+            if done[1] >= end:
+                break
+            done = next(repairs, None)
+        if start < end:
+            remaining.append((start, end))
+    return remaining
+
+
+def _aux_ledger(records: list[dict]) -> tuple[dict[_AuxKey, list[_ReadWindow]], dict[_AuxKey, list[_ReadWindow]],
+                                             dict[_AuxKey, datetime]]:
+    """Replay window obligations and completions from finalized audit manifests."""
+    pending: dict[_AuxKey, list[_ReadWindow]] = {}
+    complete: dict[_AuxKey, list[_ReadWindow]] = {}
+    cursors: dict[_AuxKey, datetime] = {}
+    for record in records:
+        entries = record.get("auxiliary_updates")
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            try:
+                account, agreement, point, resolution, dataset = entry["target"]
+                if (not all(isinstance(value, str) for value in (account, agreement, point, resolution, dataset))
+                        or dataset not in _AUX_DATASETS):
+                    continue
+                key = account, agreement, point, resolution, dataset
+                due = [_ledger_window(text) for text in entry["due"]]
+                repaired = [_ledger_window(text) for text in entry["repaired"]]
+                if entry.get("cursor"):
+                    cursors[key] = _ledger_window(entry["cursor"])[0]
+            except (AttributeError, TypeError, KeyError, ValueError, OverflowError):
+                continue
+            confirmed = _merge_aux_windows([*complete.get(key, ()), *repaired])
+            if confirmed:
+                complete[key] = confirmed
+            # A failed overlap refresh does not invalidate an older successful
+            # response. Keep the new tail pending without retrying the good part.
+            remaining = _subtract_aux_windows([*pending.get(key, ()), *due], confirmed)
+            if remaining:
+                pending[key] = remaining
+            else:
+                pending.pop(key, None)
+                cursors.pop(key, None)
+    return pending, complete, cursors
+
+
+def _aux_rows(dataset: str, doc, target: Target, parser):
+    from history import _parse_window, _zone
+
+    if dataset == "weather":
+        premises = _response_nodes(_response_account(doc), "premisesConnection")
+        matches = [p for p in premises if not target.premise_uuid or p.get("uuid") == target.premise_uuid]
+        if len(matches) != 1 or not isinstance(matches[0].get("weather"), list):
+            raise UpstreamError("Opower omitted the requested premise weather response.")
+        doc = {"data": {"billingAccountByAuthContext": {"premisesConnection": {"edges": [{"node": matches[0]}]}}}}
+    else:
+        doc = _point_response(doc, target, ("demand",) if dataset == "demand_maxima" else _USAGE_STREAMS)
+    rows = list(parser(doc))
+    zone = _zone(target.timezone)
+    for row in rows:
+        _parse_window(row["timeInterval"], zone, date_ok=dataset == "weather")
+    return rows
+
+
 def _harvest(client, run_dir: Path, published: Path, account: str | None, interval: str | None,
              resolution: str | None, all_service_points: bool, green_button: bool, history,
-             backfill: bool, overlap_hours: int) -> dict[str, Any]:
-    from history import plan_windows
+             backfill: bool, overlap_hours: int, *, retrieved: datetime, records: list[dict],
+             archive_failures: int) -> dict[str, Any]:
+    from history import _resolution, plan_explicit_windows, plan_windows
 
-    explicit = chunk_interval(interval) if interval is not None else None
+    explicit = interval is not None
     metadata = client.metadata()
     targets = client.service_points(metadata)
     primary = select_target(targets, account or os.environ.get("EVERSMART_ACCOUNT"))
@@ -1000,7 +1187,10 @@ def _harvest(client, run_dir: Path, published: Path, account: str | None, interv
     write_raw(run_dir / "metadata.json.gz", metadata)
     errors: dict[str, str] = {}
     warnings: dict[str, str] = {}
+    if archive_failures:
+        warnings["archive_recovery"] = f"Archive recovery skipped {archive_failures} invalid or unreadable run(s)."
     usage_rows: list[dict[str, Any]] = []
+    primary_usage_rows = 0
     cost_rows: list[dict[str, Any]] = []
     pricing_rows: list[dict[str, Any]] = []
     demand_rows: list[dict[str, Any]] = []
@@ -1009,53 +1199,62 @@ def _harvest(client, run_dir: Path, published: Path, account: str | None, interv
     service_point_rows = [asdict(t) for t in targets]
 
     plans: dict[str, list[str]] = {}
-    work = []
+    work: list[tuple[Target, str, str, list[str]]] = []
     filenames: set[str] = set()
     for target in selected:
-        if not target.account or target.account in plans:
+        if not target.account or target.account in plans or not target.service_agreement_uuid or not target.service_point_uuid:
             raise LocalError("Authenticated metadata did not identify unique service points.")
         actual_resolution = resolution or target.resolution
         if not actual_resolution:
             raise LocalError("The selected service point did not advertise a read resolution.")
-        if explicit is None:
+        if not explicit:
             windows = plan_windows(target.available_interval, actual_resolution,
                                    history.coverage(target.account, actual_resolution),
-                                   backfill=backfill, overlap_hours=overlap_hours)
+                                   backfill=backfill, overlap_hours=overlap_hours, timezone=target.timezone)
         else:
-            windows = explicit
+            try:
+                windows = plan_explicit_windows(interval, actual_resolution, timezone=target.timezone)
+            except (ValueError, OverflowError):
+                raise LocalError("Invalid interval for the requested read resolution and meter timezone.") from None
+            if not windows:
+                raise LocalError("The requested interval contains no complete meter-local days.")
         plans[target.account] = windows
         # Never allow upstream identifiers to escape the private staging directory.
         suffix = re.sub(r"[^a-zA-Z0-9_-]", "_", target.account).replace("-", "_")
         while suffix in filenames:
             suffix += "_"
         filenames.add(suffix)
+        work.append((target, actual_resolution, suffix, windows))
         for index, actual_interval in enumerate(windows, 1):
             raw_suffix = suffix if len(windows) == 1 else f"{suffix}.{index:04d}"
-            usage = _required_usage(client, target, actual_interval, actual_resolution)
-            usage_rows.extend(iter_stream_reads(usage))
+            usage, rows = _required_usage(client, target, actual_interval, actual_resolution)
+            usage_rows.extend(rows)
+            if target is primary:
+                primary_usage_rows += len(rows)
             write_raw(run_dir / f"usage_{raw_suffix}.json.gz", usage)
-            work.append((target, actual_interval, actual_resolution, suffix, raw_suffix))
 
     cooldown = 0.0
 
-    def optional(name, fetch, *, issue=None, sink=None, parser=None, warning=False, transient_as_warning=False):
+    def optional(name, fetch, *, issue=None, sink=None, parser=None, warning=False, transient_as_warning=False) -> bool:
         nonlocal cooldown
         if cooldown:
-            return  # Respect cooldown before making any additional upstream calls.
+            return False  # Respect cooldown before making any additional upstream calls.
         try:
             doc = fetch()
         except Exception as exc:
             cooldown = retry_delay(exc)
             record_optional_issue(issue or name, exc, warning, transient_as_warning)
-            return
+            return False
         write_raw(run_dir / f"{name}.json.gz", doc)
         if sink is not None and parser is not None:
             try:
                 rows = list(parser(doc))
             except Exception as exc:
                 record_optional_issue(issue or name, exc, warning, transient_as_warning)
+                return False
             else:
                 sink.extend(rows)
+        return True
 
     def record_optional_issue(name, exc, warning, transient_as_warning):
         if warning:
@@ -1064,15 +1263,61 @@ def _harvest(client, run_dir: Path, published: Path, account: str | None, interv
             write_noncritical_issue(run_dir, name, exc, errors, warnings,
                                     transient_as_warning=transient_as_warning)
 
-    for target, actual_interval, actual_resolution, suffix, raw_suffix in work:
-        optional(f"cost_{raw_suffix}", lambda: client.cost(target, actual_interval, actual_resolution),
-                 issue=f"cost_{suffix}", sink=cost_rows, parser=iter_stream_reads)
-        optional(f"pricing_{raw_suffix}", lambda: client.pricing(target, actual_interval, actual_resolution),
-                 issue=f"pricing_{suffix}", sink=pricing_rows, parser=iter_pricing_components)
-        optional(f"demand_maxima_{raw_suffix}", lambda: client.demand_maxima(target, actual_interval),
-                 issue=f"demand_maxima_{suffix}", sink=demand_rows, parser=iter_demand_maxima)
-        optional(f"weather_{raw_suffix}", lambda: client.weather(target, actual_interval),
-                 issue=f"weather_{suffix}", sink=weather_rows, parser=iter_weather_rows)
+    pending, complete, cursors = _aux_ledger(records)
+    updates = []
+    endpoints = {
+        "cost": (cost_rows, iter_stream_reads), "pricing": (pricing_rows, iter_pricing_components),
+        "demand_maxima": (demand_rows, iter_demand_maxima), "weather": (weather_rows, iter_weather_rows),
+    }
+    for target, actual_resolution, suffix, windows in work:
+        identity = target.account, target.service_agreement_uuid, target.service_point_uuid
+        fresh = [_ledger_window(window) for window in windows]
+        for dataset in _AUX_DATASETS:
+            cadence = _resolution(actual_resolution) if dataset in ("cost", "pricing") else ""
+            key = (*identity, cadence, dataset)
+            keys: list[_AuxKey] = [key]
+            if not explicit:
+                # Do not abandon an older pending cadence when --resolution changes.
+                keys.extend(sorted(k for k in pending if k != key and k[:3] == identity and k[-1] == dataset))
+            sink, parser = endpoints[dataset]
+            budget = _AUX_WINDOWS_PER_DATASET
+            number = 0
+            for item in keys:
+                due = fresh if item == key else []
+                existing = pending.get(item, []) if not explicit else []
+                planned = _merge_aux_windows([*existing, *due]) if existing else due
+                cursor = cursors.get(item)
+                if cursor is not None and not explicit and len(planned) > budget:
+                    planned.sort(key=lambda pair, after=cursor: (pair[0] <= after, pair[0]))
+                requests = planned if explicit else planned[:budget]
+                repaired = []
+                last_attempt = None
+                for request_index, pair in enumerate(requests):
+                    if cooldown:
+                        break
+                    raw_interval = windows[request_index] if item == key and not existing else _window_text(pair)
+                    number += 1
+                    raw_suffix = suffix if len(keys) == len(requests) == 1 else f"{suffix}.{number:04d}"
+
+                    def fetch():
+                        method = getattr(client, dataset)
+                        if cadence:
+                            read_resolution = actual_resolution if item == key else item[3]
+                            return method(target, raw_interval, read_resolution)
+                        return method(target, raw_interval)
+
+                    last_attempt = _window_text(pair)
+                    if optional(f"{dataset}_{raw_suffix}", fetch, issue=f"{dataset}_{suffix}", sink=sink,
+                                parser=lambda doc: _aux_rows(dataset, doc, target, parser)):
+                        repaired.append(last_attempt)
+                budget -= len(requests)
+                if due or last_attempt:
+                    completed = complete.get(item, [])
+                    gaps = _subtract_aux_windows(due, completed) if completed else due
+                    new_repairs = _subtract_aux_windows([_ledger_window(text) for text in repaired], completed)
+                    if gaps or new_repairs or (existing and last_attempt):
+                        updates.append({"target": list(item), "due": [_window_text(pair) for pair in gaps],
+                                        "repaired": [_window_text(pair) for pair in new_repairs], "cursor": last_attempt})
 
     optional("bills", lambda: client.bills(primary), sink=bill_rows, parser=iter_bill_segments)
     optional("bill_forecast", lambda: client.forecast(primary), warning=True)
@@ -1115,8 +1360,10 @@ def _harvest(client, run_dir: Path, published: Path, account: str | None, interv
 
     primary_windows = plans[primary.account]
     return {
-        "retrieved_at_utc": published.name.split(".", 1)[0],
-        "poll_status": "collected",
+        "archive_format": 1,
+        "retrieved_at_utc": retrieved.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+        "poll_status": "collected" if primary_usage_rows else "no_op",
+        "success": bool(primary_usage_rows),
         "account": primary.account,
         "entity_id": primary.entity_id,
         "service_agreement_uuid": primary.service_agreement_uuid,
@@ -1131,13 +1378,43 @@ def _harvest(client, run_dir: Path, published: Path, account: str | None, interv
         "timezone": primary.timezone,
         "target_count": len(selected),
         "service_points": service_point_rows,
-        "usage_rows": len(usage_rows), "cost_rows": len(cost_rows), "pricing_rows": len(pricing_rows),
+        "usage_rows": len(usage_rows), "primary_usage_rows": primary_usage_rows,
+        "cost_rows": len(cost_rows), "pricing_rows": len(pricing_rows),
         "weather_rows": len(weather_rows), "bill_rows": len(bill_rows), "demand_maxima_rows": len(demand_rows),
         "green_button_rows": len(gb_rows), "green_button": gb_manifest,
         "errors": errors, "warnings": warnings, "cost_error": errors.get(f"cost_{primary.account.replace('-', '_')}"),
         "output_dir": str(published.resolve()),
         "retry_after_seconds": cooldown,
+        "retry_not_before_utc": _format_opower_datetime(datetime.now(timezone.utc) + timedelta(seconds=cooldown)) if cooldown else None,
+        "auxiliary_updates": updates,
+        "archive_failures": archive_failures,
     }
+
+
+def _archived_time(text) -> datetime | None:
+    if not isinstance(text, str):
+        return None
+    try:
+        if re.fullmatch(r"[0-9]{8}T[0-9]{6}Z", text):
+            return datetime.strptime(text, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        value = datetime.fromisoformat(text)
+        return value.astimezone(timezone.utc) if value.utcoffset() is not None else None
+    except (OverflowError, ValueError):
+        return None
+
+
+def _last_required_result(records: list[dict], account: str) -> str | None:
+    # Pre-existing manifests used `collected` even for empty responses. Do not
+    # infer a new success from them without a positive reading count.
+    for record in reversed(records):
+        if (record.get("account") or record.get("utility_id")) != account:
+            continue
+        count = record.get("primary_usage_rows", record.get("usage_rows"))
+        if (isinstance(count, int) and count > 0 and record.get("success") is not False
+                and record.get("poll_status", "collected") == "collected"
+                and _archived_time(record.get("retrieved_at_utc")) is not None):
+            return record["retrieved_at_utc"]
+    return None
 
 
 def collect_once(client: EversourceClient, outdir: Path, account: str | None, interval: str | None,
@@ -1161,33 +1438,55 @@ def collect_once(client: EversourceClient, outdir: Path, account: str | None, in
             if history is None:
                 # Also recovers a completed audit run left by a crash or failed ingestion.
                 store.ingest_archive(outdir)
+            archive_failures = getattr(store, "archive_failures", 0)
+            manifests = getattr(store, "manifests", None)
+            records = manifests() if manifests else []
+            now = datetime.now(timezone.utc)
+            latest = max((stamp for record in records if (stamp := _archived_time(record.get("retrieved_at_utc")))
+                          is not None), default=None)
+            retry_at = max((stamp for record in records if (stamp := _archived_time(record.get("retry_not_before_utc")))
+                            is not None), default=None)
+            if retry_at and retry_at > now:
+                return {"poll_status": "deferred", "dashboard_state": "retained",
+                        "retry_after_seconds": (retry_at - now).total_seconds(), "archive_failures": archive_failures}
+            retrieved = max(now, latest + timedelta(microseconds=1)) if latest is not None else now
             with tempfile.TemporaryDirectory(prefix=".collect-", dir=outdir) as directory:
                 staging = Path(directory)
                 # Keep the staged manifest out of the archive's */manifest.json namespace.
                 run_dir = staging / "run"
                 make_private_directory(run_dir)
-                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                stamp = retrieved.strftime("%Y%m%dT%H%M%SZ")
                 published = outdir / stamp
                 # Keep the legacy timestamp prefix without overwriting same-second runs.
                 if published.exists():
                     published = outdir / f"{stamp}.{staging.name.removeprefix('.collect-')}"
                 manifest = _harvest(client, run_dir, published, account, interval, resolution,
-                                    all_service_points, green_button, store, backfill, overlap_hours)
+                                    all_service_points, green_button, store, backfill, overlap_hours,
+                                    retrieved=retrieved, records=records, archive_failures=archive_failures)
                 write_json(run_dir / "manifest.json", manifest)
                 run_dir.rename(published)
             # The archive is append-only, so an ingestion failure does not lose data.
             if not store.ingest_run(published):
                 raise LocalError("History did not ingest the completed audit run; dashboard retained.")
-        # Optional datasets may be unavailable for days. Publish the canonical
-        # usage with diagnostics; only required failures retain the old view.
+            previous_success = _last_required_result(records, manifest["account"])
+            # A legacy/imported archive might have readings without a row count
+            # on its manifest. This allows a repair to render from that history.
+            has_history = bool(previous_success or (not manifest["primary_usage_rows"]
+                               and manifests and store.rows("usage", manifest["account"])))
+        result = {**manifest, "last_successful_poll_at_utc": (
+            manifest["retrieved_at_utc"] if manifest["primary_usage_rows"] else previous_success
+        ), "dashboard_state": "retained"}
+        repaired = any(manifest[f"{dataset}_rows"] for dataset in _AUX_DATASETS)
+        if not manifest["primary_usage_rows"] and not (has_history and (repaired or not output.is_file())):
+            return result
+        # Dashboard publication is not part of the immutable acquisition record.
         try:
             path = publish_dashboard(outdir, output, db_path=db_path, account=manifest["account"],
                                      manual_bill_dir=manual_bill_dir, renderer=renderer)
-            manifest["dashboard"] = str(path)
+            result.update(dashboard=str(path), dashboard_state="published")
         except Exception as exc:
-            manifest["dashboard_error"] = safe_error(exc, "Dashboard rendering failed; details withheld.")
-        write_json(published / "manifest.json", manifest)
-        return manifest
+            result["dashboard_error"] = safe_error(exc, "Dashboard rendering failed; details withheld.")
+        return result
 
 
 def _report_status(state: Path, status: dict[str, Any], *, failed: bool = False, persist: bool = True) -> None:
@@ -1200,38 +1499,58 @@ def _report_status(state: Path, status: dict[str, Any], *, failed: bool = False,
 
 def _supervise(collect, state: Path, poll: int | None, sleep) -> int:
     failures = 0
+    try:
+        previous = json.loads((state / "status.json").read_text())
+    except (OSError, ValueError):
+        previous = {}
+    if not isinstance(previous, dict):
+        previous = {}
+    last_success = previous.get("last_successful_poll_at_utc")
     while True:
         cooldown = 0.0
         status: dict[str, Any]
         failed = False
         degraded = False
         try:
-            manifest = collect()
-            cooldown = manifest.get("retry_after_seconds", 0)
-            degraded = bool(manifest.get("errors") or manifest.get("warnings"))
-            failed = "dashboard_error" in manifest
+            result = collect()
+            cooldown = result.get("retry_after_seconds", 0)
+            degraded = bool(result.get("errors") or result.get("warnings"))
+            failed = "dashboard_error" in result
+            if "last_successful_poll_at_utc" in result:
+                last_success = result["last_successful_poll_at_utc"]
+            operation = result.get("poll_status", "collected")
             if failed:
-                status = {"status": "render_failed", "error": manifest["dashboard_error"]}
-            elif degraded:
-                status = {"status": "degraded", "dashboard": "published",
-                          "optional_errors": len(manifest.get("errors", {})),
-                          "optional_warnings": len(manifest.get("warnings", {}))}
+                status = {"status": "render_failed", "error": result["dashboard_error"]}
             else:
-                status = {"status": "collected"}
+                status = {"status": "degraded" if degraded and operation == "collected" else operation}
+            if "dashboard_state" in result:
+                status["dashboard"] = result["dashboard_state"]
+            if degraded:
+                status.update(optional_errors=len(result.get("errors", {})), optional_warnings=len(result.get("warnings", {})))
+            if result.get("archive_failures"):
+                status["archive_failures"] = result["archive_failures"]
+            if cooldown:
+                status["retry_after_seconds"] = cooldown
         except LockBusy:
             raise
         except Exception as exc:
             failed = True
             cooldown = retry_delay(exc)
             status = {"status": "collection_failed", "error": safe_error(exc, "Collection failed; details withheld.")}
-        if poll is None:
+        if last_success is not None:
+            status["last_successful_poll_at_utc"] = last_success
+        if poll is not None:
+            failures = min(failures + 1, 8) if failed or degraded else 0
+            status["next_attempt_in_seconds"] = max(poll, min(3600, poll * 2 ** failures), cooldown)
+        try:
             _report_status(state, status, failed=failed)
+        except OSError:
+            # Writing the receipt is not the commit point for dashboard publication.
+            status["status_write_error"] = "Unable to persist collection status."
+            _report_status(state, status, failed=failed, persist=False)
+        if poll is None:
             return int(failed)
-        failures = min(failures + 1, 8) if failed or degraded else 0
-        delay = max(poll, min(3600, poll * 2 ** failures), cooldown)
-        status["next_attempt_in_seconds"] = delay
-        _report_status(state, status, failed=failed)
-        sleep(delay)
+        sleep(status["next_attempt_in_seconds"])
 
 
 def main(argv: list[str] | None = None, *, client_factory=None, renderer=None, sleep=None) -> int:
@@ -1265,27 +1584,34 @@ def main(argv: list[str] | None = None, *, client_factory=None, renderer=None, s
     if args.poll is not None and args.shareable:
         ap.error("--shareable is a one-shot export and cannot run with --poll")
     offline = bool(args.import_archive or args.render or args.shareable)
-    explicit_collection = bool(args.collect or args.poll or args.backfill or args.interval
-                               or args.green_button or args.all_service_points or args.resolution)
+    collection_options = bool(args.poll or args.backfill or args.interval or args.green_button
+                              or args.all_service_points or args.resolution)
+    explicit_collection = bool(args.collect or collection_options)
     if args.login and (offline or explicit_collection):
         ap.error("--login cannot be combined with collection or offline actions")
+    if offline and collection_options and not args.collect:
+        ap.error("Use --collect to combine a collection option with an offline action")
     collect = not args.login and (explicit_collection or not offline)
     state = state_directory(args.state_dir)
     outdir = args.out or state / "data"
     db_path = state / "history.sqlite"
     output = state / "dashboard.html"
-    if args.shareable and args.shareable.resolve() in {
-        output.resolve(), db_path.resolve(), (state / "status.json").resolve(),
-        (state / ".env").resolve(), (state / ".eversource_cookies.txt").resolve(),
-        (state / "cookieinfo.txt").resolve(), (state / "eversmart.lock").resolve(),
-        (state / "history.sqlite.lock").resolve(),
-    }:
-        ap.error("--shareable must not overwrite private state or the live dashboard")
     manual_bill_dir = args.manual_bill_dir or state / "bills"
+    if args.shareable:
+        try:
+            target = args.shareable.resolve()
+            roots = (state, outdir, args.import_archive, manual_bill_dir)
+            if any(target.is_relative_to(root.resolve()) for root in roots if root is not None):
+                ap.error("--shareable must be outside the state, audit, import, and bills directories")
+        except (OSError, RuntimeError):
+            ap.error("Unable to resolve the shareable output or its private directory boundaries")
+        if args.shareable.exists() or args.shareable.is_symlink():
+            ap.error("The export destination already exists; choose a new file")
+        args.shareable = target
     sleep = sleep or time.sleep
     stage = "startup"
     try:
-        make_private_directory(state)
+        require_private_directory(state)
         with process_lock(state / "eversmart.lock"):
             try:
                 # Account and entity arguments and environment win over private config.
@@ -1299,7 +1625,9 @@ def main(argv: list[str] | None = None, *, client_factory=None, renderer=None, s
                     from history import History
                     with process_lock(db_path.with_suffix(db_path.suffix + ".lock")), History(db_path) as store:
                         imported = store.ingest_archive(args.import_archive)
-                    _report_status(state, {"status": "imported", "imported_runs": imported})
+                        skipped = store.archive_failures
+                    _report_status(state, {"status": "imported", "imported_runs": imported,
+                                           "skipped_invalid_runs": skipped})
                 if args.login:
                     stage = "login"
                     client = (client_factory or EversourceClient)(cookie_file=args.cookie_file,

@@ -36,6 +36,8 @@ python3.11 eversmart.py --backfill        # Fetch gaps in advertised history
 
 The first collection downloads the latest API-sized window. Later runs refresh an overlap for delayed reads and corrections, and catch up if the collector was offline. Explicit `--interval '2026-06-03T00:00:00-04:00/2026-08-06T00:00:00-04:00'` requests are split into windows of at most 720 elapsed hours rather than silently truncated. `--resolution` selects the desired read cadence. Use `--green-button` only for occasional one-shot audits; it starts a remote export job. Use `--out` to choose a private location for new audit snapshots.
 
+Collection options do not start network requests when mixed with an offline action unless you also provide `--collect`.
+
 For scheduled use, prefer running the one-shot command under `launchd` or a systemd timer. Keep the state directory and service account consistent across invocations. The CLI rejects overlapping operations on the same state. `status.json` carries the latest operation status; the current dashboard remains available if collection or rendering fails. `--render` rebuilds it offline from the database.
 
 ## How to read the numbers
@@ -52,7 +54,7 @@ The normal dashboard, database, meter photos, statements and CSV/JSON archives a
 python3.11 eversmart.py --shareable /path/to/energy-summary.html
 ```
 
-Those three numbers still come from your meter; review them before sharing. Keep downloaded materials and secrets out of Git. The checked-in `meter_inventory` files are sanitized model notes, not a mapping to a real customer account. See [SECURITY.md](SECURITY.md).
+Choose a new filename outside the private state, archive, and bills directories. The export never replaces an existing file. Those three numbers still come from your meter; review them before sharing. Keep downloaded materials and secrets out of Git. The checked-in `meter_inventory` files are sanitized model notes, not a mapping to a real customer account. See [SECURITY.md](SECURITY.md).
 
 ## Develop
 

@@ -37,6 +37,14 @@ def day_reads(day):
     return [read(start + timedelta(hours=i)) for i in range(int((end - start).total_seconds() / 3600))]
 
 
+def quarter_reads(day, value=0.5):
+    start = datetime.combine(day, time.min, ZONE).astimezone(UTC)
+    end = datetime.combine(day + timedelta(days=1), time.min, ZONE).astimezone(UTC)
+    step = timedelta(minutes=15)
+    starts = (start + i * step for i in range((end - start) // step))
+    return [read(t, value, end=t + step) for t in starts]
+
+
 def bill(start, end, service="ELECTRICITY"):
     return {"segment_urn": f"synthetic-{service}-{end.date()}", "serviceType": service,
             "timeInterval": span(start, end), "usageInterval": span(start, end), "kwh": 456}
@@ -68,11 +76,11 @@ class DashboardReliabilityTest(unittest.TestCase):
                     writer.writerows(rows)
         return manifest
 
-    def statement(self, **fields):
+    def statement(self, filename="statement.json", **fields):
         statement = {"statement_date": "2026-09-10", "billing_period_start": "2026-08-10",
                      "billing_period_end": "2026-09-09", "total_due": 280,
                      "total_current_charges": 110, "total_billed_kwh": 400, "customer_charge": 10, **fields}
-        (self.manual / "statement.json").write_text(json.dumps(statement))
+        (self.manual / filename).write_text(json.dumps(statement))
 
     def recent_bill(self):
         # UTC boundary is Oct 10 locally at midnight; gas ends even later and
@@ -82,6 +90,14 @@ class DashboardReliabilityTest(unittest.TestCase):
 
     def build(self, **kwargs):
         return dashboard.build_dashboard_data(self.data, manual_bill_dir=self.manual, **kwargs)
+
+    def indexed(self, expected_runs):
+        from history import History
+
+        db = self.root / "history.sqlite"
+        with History(db) as history:
+            self.assertEqual(history.ingest_archive(self.data), expected_runs)
+        return db
 
     def test_forecast_uses_latest_electricity_boundary_but_physical_rate(self):
         self.statement()
@@ -140,6 +156,123 @@ class DashboardReliabilityTest(unittest.TestCase):
         self.poll("20261011T060000Z", bills=[electric], usage=day_reads(datetime(2026, 10, 10).date()))
         cycle = self.build(as_of=datetime(2026, 10, 11, 6, tzinfo=UTC))["latest"]["current_billing_cycle"]
         self.assertEqual(cycle["reason"], "unknown_cycle")
+
+    def test_assigned_statement_is_selected_before_redaction_and_deduplication(self):
+        self.poll("20261011T060000Z", usage=day_reads(datetime(2026, 10, 10).date()), bills=self.recent_bill())
+        self.statement("a-unrelated.json", account="synthetic-other-meter", total_current_charges=210,
+                       line_items=[{"description": "Synthetic other charge"}])
+        self.statement("b-selected.json", account=ACCOUNT, account_number="synthetic-statement-number")
+        data = self.build(account=ACCOUNT, as_of=datetime(2026, 10, 11, 6, tzinfo=UTC))
+        self.assertEqual(data["latest"]["bill_cost_modes"]["bill_calibrated_variable_rate"], 0.25)
+        self.assertEqual(len(data["manual_bills"]), 1)
+        self.assertNotIn("account", data["manual_bills"][0])
+        self.assertNotIn("account_number", data["manual_bills"][0])
+
+    def test_printed_statement_identity_is_not_a_selectable_meter_id(self):
+        self.poll("20261011T060000Z")
+        self.statement(account_number="0000-synthetic-invoice-account")
+        data = self.build(account=ACCOUNT)
+        self.assertEqual(data["manual_bills"][0]["total_current_charges"], 110)
+        self.assertNotIn("account_number", data["manual_bills"][0])
+
+    def test_unknown_statements_are_ignored_across_account_history_even_when_selected(self):
+        self.poll("20261010T060000Z", manifest={"account": "another-synthetic-account"})
+        self.poll("20261011T060000Z", usage=day_reads(datetime(2026, 10, 10).date()), bills=self.recent_bill())
+        # An invoice number identical to the selectable ID still isn't an assignment.
+        self.statement(account_number=ACCOUNT)
+        for backend in ({}, {"db_path": self.indexed(2)}):
+            with self.subTest(backend=backend):
+                data = self.build(account=ACCOUNT, **backend)
+                self.assertEqual(data["manual_bills"], [])
+                self.assertIsNone(data["latest"]["bill_reconciliation"])
+                self.assertNotIn("bill_cost_modes", data["latest"])
+
+    def test_collection_windows_show_other_relevant_accounts_without_inventory(self):
+        start = datetime(2026, 10, 10, 4, tzinfo=UTC)
+        self.poll("20261011T060000Z", usage=[read(start)], manifest={"collection_windows": {
+            ACCOUNT: [span(start)], "synthetic-secondary-account": [span(start)],
+        }})
+        self.statement()
+        for backend in ({}, {"db_path": self.indexed(1)}):
+            with self.subTest(backend=backend):
+                self.assertEqual(self.build(account=ACCOUNT, **backend)["manual_bills"], [])
+
+    def test_unknown_pdf_is_not_used_when_same_account_has_two_service_points(self):
+        self.poll("20261011T060000Z", manifest={"service_point_uuid": "synthetic-meter", "service_points": [
+            {"account": ACCOUNT, "service_point_uuid": "synthetic-meter"},
+            {"account": ACCOUNT, "service_point_uuid": "synthetic-second-meter"},
+        ]})
+        (self.manual / "unassigned.pdf").touch()
+        self.statement("assigned.json", source="assigned.pdf", service_point_uuid="synthetic-meter")
+        text = "Statement Date: 10/10/26\nTotal Current Charges\n$400.00\n= 400 Total Billed Usage"
+        with patch.object(dashboard, "_extract_pdf_text", return_value=text):
+            data = self.build(account=ACCOUNT)
+        self.assertEqual([b["source"] for b in data["manual_bills"]], ["assigned.pdf"])
+        self.assertNotIn("service_point_uuid", data["manual_bills"][0])
+
+    def test_cycle_uses_selected_electricity_service_agreement(self):
+        day = datetime(2026, 10, 10).date()
+        self.statement(account=ACCOUNT)
+        electric, gas = self.recent_bill()
+        electric["service_agreement_uuid"] = "synthetic-agreement"
+        foreign = bill(datetime(2026, 10, 10, 4, tzinfo=UTC), datetime(2026, 11, 10, 5, tzinfo=UTC))
+        foreign["service_agreement_uuid"] = "another-synthetic-agreement"
+        # Unknown electricity cannot be used to fill in for either agreement.
+        unknown = bill(datetime(2026, 10, 15, 4, tzinfo=UTC), datetime(2026, 11, 15, 5, tzinfo=UTC))
+        self.poll("20261011T060000Z", usage=day_reads(day), bills=[electric, gas, foreign, unknown],
+                  manifest={"service_agreement_uuid": "synthetic-agreement", "service_points": [
+                      {"account": ACCOUNT, "service_agreement_uuid": "synthetic-agreement"},
+                      {"account": "another-synthetic-account", "service_agreement_uuid": "another-synthetic-agreement"},
+                  ]})
+        for backend in ({}, {"db_path": self.indexed(1)}):
+            with self.subTest(backend=backend):
+                cycle = self.build(account=ACCOUNT, as_of=datetime(2026, 10, 11, 6, tzinfo=UTC), **backend)["latest"]["current_billing_cycle"]
+                self.assertEqual(cycle["cycle_start_date"], "2026-10-10")
+                self.assertEqual(cycle["kwh_so_far"], 24)
+
+    def test_other_meter_cannot_fill_selected_meter_holes_for_billing(self):
+        day = datetime(2026, 10, 10).date()
+        rows = day_reads(day)
+        rows[-1]["service_point_uuid"] = "synthetic-other-meter"
+        self.statement(account=ACCOUNT, service_periods=[{"kind": "smart_meter", "start_date": str(day), "end_date": str(day), "usage_kwh": 24}])
+        self.poll("20261011T060000Z", usage=rows, bills=self.recent_bill(), manifest={"service_point_uuid": "synthetic-meter"})
+        rec = self.build(account=ACCOUNT)["latest"]["bill_reconciliation"]
+        self.assertEqual(rec["status"], "partial_overlap")
+        self.assertEqual(rec["smart_meter_overlap_kwh"], 23)
+
+    def test_multiple_unmapped_electricity_agreements_do_not_pick_a_cycle(self):
+        electric, _ = self.recent_bill()
+        electric["service_agreement_uuid"] = "synthetic-unknown-agreement-a"
+        other = bill(datetime(2026, 10, 10, 4, tzinfo=UTC), datetime(2026, 11, 10, 5, tzinfo=UTC))
+        other["service_agreement_uuid"] = "synthetic-unknown-agreement-b"
+        self.statement(billing_period_start=None, billing_period_end=None)
+        self.poll("20261011T060000Z", bills=[electric, other])
+        cycle = self.build(account=ACCOUNT, as_of=datetime(2026, 10, 11, 6, tzinfo=UTC))["latest"]["current_billing_cycle"]
+        self.assertEqual(cycle["reason"], "unknown_cycle")
+
+    def test_foreign_statement_sidecar_does_not_leave_an_unscoped_pdf_fallback(self):
+        self.poll("20261011T060000Z")
+        self.statement(account="synthetic-other-meter", source="synthetic-statement.pdf")
+        (self.manual / "synthetic-statement.pdf").touch()
+        text = "Statement Date: 10/10/26\nTotal Current Charges\n$400.00\n= 400 Total Billed Usage"
+        with patch.object(dashboard, "_extract_pdf_text", return_value=text):
+            self.assertEqual(self.build(account=ACCOUNT)["manual_bills"], [])
+
+    def test_foreign_statement_sidecar_protects_same_stem_pdf_without_source_field(self):
+        self.poll("20261011T060000Z")
+        self.statement(account="synthetic-other-meter")
+        (self.manual / "statement.pdf").touch()
+        text = "Statement Date: 10/10/26\nTotal Current Charges\n$400.00\n= 400 Total Billed Usage"
+        with patch.object(dashboard, "_extract_pdf_text", return_value=text):
+            self.assertEqual(self.build(account=ACCOUNT)["manual_bills"], [])
+
+    def test_explicit_directory_scope_allows_unknown_statements_but_not_foreign_assignments(self):
+        self.poll("20261010T060000Z", manifest={"account": "another-synthetic-account"})
+        self.poll("20261011T060000Z")
+        self.statement(account_number="synthetic-printed-number")
+        self.statement("foreign.json", account="another-synthetic-account", statement_date="2026-10-10")
+        self.assertEqual([b["statement_date"] for b in self.build(account=ACCOUNT, manual_bill_account=ACCOUNT)["manual_bills"]],
+                         ["2026-09-10"])
 
     def test_balance_is_not_a_rate(self):
         self.statement(total_current_charges=None)
@@ -259,7 +392,7 @@ class DashboardReliabilityTest(unittest.TestCase):
                 self_test.assertEqual(account, ACCOUNT)
                 return manifest
             def manifests(self, account=None):
-                self_test.assertEqual(account, ACCOUNT)
+                self_test.assertIn(account, (ACCOUNT, None))
                 return [manifest]
             def rows(self, dataset, account, start=None, end=None):
                 self_test.assertEqual(account, ACCOUNT)
@@ -297,6 +430,78 @@ class DashboardReliabilityTest(unittest.TestCase):
         latest = self.build()["latest"]
         self.assertEqual(latest["total_net_kwh"], 30)
         self.assertEqual(latest["status"]["usage_intervals"]["actual"], 1)
+
+    def test_partial_quarter_hour_refresh_preserves_complete_hourly_history(self):
+        day = datetime(2026, 10, 10).date()
+        self.statement(service_periods=[{"kind": "smart_meter", "start_date": str(day), "end_date": str(day), "usage_kwh": 24}])
+        self.poll("20261011T050000Z", usage=day_reads(day), bills=self.recent_bill())
+        self.poll("20261011T060000Z", usage=quarter_reads(day)[:3], manifest={"resolution": "QUARTER_HOUR"})
+        for backend in ({}, {"db_path": self.indexed(2)}):
+            with self.subTest(backend=backend):
+                latest = self.build(as_of=datetime(2026, 10, 11, 6, tzinfo=UTC), **backend)["latest"]
+                self.assertEqual(latest["total_net_kwh"], 24)
+                self.assertEqual(latest["status"]["usage_intervals"]["actual"], 24)
+                self.assertEqual(latest["bill_reconciliation"]["status"], "matched")
+                self.assertEqual(latest["current_billing_cycle"]["kwh_so_far"], 24)
+
+    def test_full_finer_history_survives_later_coarser_poll_on_spring_dst_day(self):
+        day = datetime(2026, 3, 8).date()
+        self.statement(service_periods=[{"kind": "smart_meter", "start_date": str(day), "end_date": str(day), "usage_kwh": 46}])
+        self.poll("20260309T060000Z", usage=day_reads(day))
+        self.poll("20260310T060000Z", usage=quarter_reads(day), manifest={"resolution": "QUARTER_HOUR"})
+        self.assertEqual(self.build()["latest"]["total_net_kwh"], 46)
+        self.poll("20260311T060000Z", usage=day_reads(day))
+        latest = self.build()["latest"]
+        self.assertEqual((latest["total_net_kwh"], len(latest["series"])), (46, 92))
+        self.assertEqual(latest["bill_reconciliation"]["status"], "matched")
+
+    def test_mixed_cadence_on_fall_dst_day_requires_exact_actual_coverage(self):
+        day = datetime(2026, 11, 1).date()
+        self.statement(service_periods=[{"kind": "smart_meter", "start_date": str(day), "end_date": str(day), "usage_kwh": 26}])
+        self.poll("20261102T060000Z", usage=day_reads(day)[:1] + day_reads(day)[2:])
+        self.poll("20261103T060000Z", usage=quarter_reads(day)[4:8], manifest={"resolution": "QUARTER_HOUR"})
+        rec = self.build()["latest"]["bill_reconciliation"]
+        self.assertEqual((rec["expected_intervals"], rec["observed_actual_intervals"], rec["status"]), (28, 28, "matched"))
+
+    def test_mixed_cadence_with_a_hole_cannot_match_even_if_usage_equals_bill(self):
+        day = datetime(2026, 11, 1).date()
+        self.statement(service_periods=[{"kind": "smart_meter", "start_date": str(day), "end_date": str(day), "usage_kwh": 25.5}])
+        self.poll("20261102T060000Z", usage=day_reads(day)[:1] + day_reads(day)[2:])
+        self.poll("20261103T060000Z", usage=quarter_reads(day)[4:7], manifest={"resolution": "QUARTER_HOUR"})
+        rec = self.build()["latest"]["bill_reconciliation"]
+        self.assertEqual((rec["difference_kwh"], rec["status"]), (0, "partial_overlap"))
+
+    def test_mixed_cadence_can_tile_day_without_a_shared_hour_grid(self):
+        day = datetime(2026, 10, 10).date()
+        midnight = datetime.combine(day, time.min, ZONE).astimezone(UTC)
+        first_hour = midnight + timedelta(minutes=15)
+        self.statement(service_periods=[{"kind": "smart_meter", "start_date": str(day), "end_date": str(day), "usage_kwh": 25}])
+        self.poll("20261011T050000Z", usage=[read(first_hour + timedelta(hours=i)) for i in range(23)])
+        fine = quarter_reads(day)
+        self.poll("20261011T060000Z", usage=fine[:1] + fine[-3:], manifest={"resolution": "QUARTER_HOUR"})
+        rec = self.build()["latest"]["bill_reconciliation"]
+        self.assertEqual((rec["difference_kwh"], rec["status"]), (0, "matched"))
+
+    def test_unusable_quarter_or_estimate_cannot_displace_actual_hour(self):
+        day = datetime(2026, 10, 10).date()
+        fine = quarter_reads(day)[:4]
+        fine[1]["readType"] = "ESTIMATED"
+        fine[2]["value"] = None
+        self.poll("20261011T050000Z", usage=day_reads(day))
+        self.poll("20261011T060000Z", usage=fine, manifest={"resolution": "QUARTER_HOUR"})
+        latest = self.build()["latest"]
+        self.assertEqual(latest["total_net_kwh"], 24)
+        self.assertEqual(latest["status"]["usage_intervals"], {"actual": 24, "estimated": 0, "unknown": 0, "missing": 0})
+
+    def test_partial_actual_quarters_do_not_erase_usable_estimated_hour(self):
+        day = datetime(2026, 10, 10).date()
+        hourly = day_reads(day)
+        hourly[0]["readType"] = "ESTIMATED"
+        self.poll("20261011T050000Z", usage=hourly)
+        self.poll("20261011T060000Z", usage=quarter_reads(day)[:2], manifest={"resolution": "QUARTER_HOUR"})
+        latest = self.build()["latest"]
+        self.assertEqual([r["duration_minutes"] for r in latest["series"]], [60] * 24)
+        self.assertEqual(latest["status"]["usage_intervals"]["estimated"], 1)
 
     def test_real_sqlite_history_uses_revisions_after_archive_moves(self):
         from history import History
@@ -420,9 +625,11 @@ class DashboardReliabilityTest(unittest.TestCase):
     def test_shareable_artifact_contains_only_allowlisted_aggregate_metrics(self):
         self.poll("20261102T060000Z", usage=day_reads(datetime(2026, 11, 1).date()),
                   manifest={"warnings": {"synthetic-diagnostic-key": "synthetic-warning-value"}, "entity_id": "synthetic-id"})
-        output = dashboard.generate_dashboard(self.data, self.root / "share.html", shareable=True, split_data=True)
+        self.statement(account=ACCOUNT, account_number="synthetic-invoice-id", source="synthetic-private-invoice.pdf")
+        output = dashboard.generate_dashboard(self.data, self.root / "share.html", shareable=True, split_data=True,
+                                              manual_bill_dir=self.manual)
         html = output.read_text()
-        for banned in (ACCOUNT, "synthetic-meter", "synthetic-diagnostic-key", "synthetic-warning-value", "synthetic-id", str(self.data), "2026-11-01", "bill_urn", "service_points", "privacySafeExport", "<script src="):
+        for banned in (ACCOUNT, "synthetic-meter", "synthetic-diagnostic-key", "synthetic-warning-value", "synthetic-id", "synthetic-invoice-id", "synthetic-private-invoice.pdf", str(self.data), "2026-11-01", "bill_urn", "service_points", "privacySafeExport", "<script src="):
             self.assertNotIn(banned, html)
         public = json.loads(re.search(r'<script type="application/json" id="dashboard-summary">(.*?)</script>', html)[1])
         self.assertEqual(set(public), {"total_net_kwh", "estimated_interval_cost_usd", "peak_demand_kw"})

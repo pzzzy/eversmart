@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import urllib.parse
 import urllib.request
-from bisect import bisect_left
+from bisect import bisect_right
 from collections import defaultdict
 from collections.abc import Iterable
 from functools import lru_cache
@@ -24,6 +24,7 @@ DASHBOARD_PATH = "dashboard.html"
 DEFAULT_METER_ZONE = ZoneInfo("America/New_York")
 MIN_CYCLE_DAYS, MAX_CYCLE_DAYS = 20, 45
 READ_MINUTES = {"QUARTER_HOUR": 15, "HALF_HOUR": 30, "HOUR": 60}
+INTERVAL_STEPS = frozenset(timedelta(minutes=minutes) for minutes in READ_MINUTES.values())
 DATASETS = ("usage", "cost", "pricing", "weather", "bills", "demand_maxima", "service_points", "green_button_rows")
 INTERVAL_POINTS = 3000
 HOURLY_POINTS = 31 * 25
@@ -446,11 +447,14 @@ def parse_eversource_bill_pdf(path: Path) -> dict[str, Any]:
     }
 
 
+BILL_SCOPE_FIELDS = ("account", "utility_id", "service_point_uuid", "service_agreement_uuid", "service_agreement_urn")
+
+
 def _sanitize_bill_for_dashboard(bill: dict[str, Any]) -> dict[str, Any]:
     """Keep bill facts useful for reconciliation while dropping meter/account PII."""
-    if bill.get("error"):
-        return dict(bill)
-    safe = {k: v for k, v in bill.items() if k not in {"meter_number", "meter_rows", "raw_text", "account", "account_number", "customer_name", "service_address", "address"}}
+    private = {*BILL_SCOPE_FIELDS, "account_number", "billing_account_number", "billing_account_uuid", "billing_account_urn",
+               "meter_number", "meter_rows", "raw_text", "customer_name", "service_address", "address"}
+    safe = {k: v for k, v in bill.items() if k not in private}
     periods = []
     for sp in bill.get("service_periods") or []:
         periods.append({
@@ -467,24 +471,43 @@ def _sanitize_bill_for_dashboard(bill: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
-def _load_manual_bills(directory: Path) -> list[dict[str, Any]]:
-    """Read statements only from the explicitly supplied directory."""
+def _load_manual_bills(directory: Path, scope, allow_unassigned) -> list[dict[str, Any]]:
+    """Filter local statements before redaction and statement deduplication."""
+    def belongs(bill):
+        assigned = [field for field in BILL_SCOPE_FIELDS if bill.get(field)]
+        return all(bill[field] == scope.get(field) for field in assigned) if assigned else allow_unassigned
+
     bills: list[dict[str, Any]] = []
+    sources = set()
+    assigned_stems = set()
     files = sorted(directory.iterdir()) if directory.is_dir() else []
     for path in files:
         if path.is_file() and path.suffix.lower() == ".json":
             try:
-                bills.append(_sanitize_bill_for_dashboard(json.loads(path.read_text())))
-            except Exception as exc:  # surfaced only in the private dashboard
-                bills.append({"source": path.name, "error": str(exc)})
-    sources = {b.get("source") for b in bills if not b.get("error")}
+                bill = json.loads(path.read_text())
+                if not bill.get("error"):
+                    # A foreign sidecar still owns its PDF. Do not read the
+                    # same statement again as an unassigned bill.
+                    if isinstance(bill.get("source"), str) and bill["source"]:
+                        sources.add(bill["source"])
+                    elif any(bill.get(field) for field in BILL_SCOPE_FIELDS):
+                        assigned_stems.add(path.stem)
+                if belongs(bill):
+                    bills.append(_sanitize_bill_for_dashboard(bill))
+            except Exception as exc:
+                if allow_unassigned:
+                    bills.append({"source": path.name, "error": str(exc)})
     for path in files:
-        if not path.is_file() or path.suffix.lower() != ".pdf" or {path.name, str(path)} & sources:
+        if (not path.is_file() or path.suffix.lower() != ".pdf" or path.stem in assigned_stems
+                or {path.name, str(path)} & sources):
             continue
         try:
-            bills.append(_sanitize_bill_for_dashboard(parse_eversource_bill_pdf(path)))
+            bill = parse_eversource_bill_pdf(path)
+            if belongs(bill):
+                bills.append(_sanitize_bill_for_dashboard(bill))
         except Exception as exc:
-            bills.append({"source": path.name, "error": str(exc)})
+            if allow_unassigned:
+                bills.append({"source": path.name, "error": str(exc)})
     by_statement: dict[tuple[Any, ...], dict[str, Any]] = {}
     errors: list[dict[str, Any]] = []
     for bill in bills:
@@ -521,11 +544,9 @@ def _bill_rates(bill):
     return variable, _safe_rate(charges, kwh), fixed
 
 
-def _expected_spans(day, zone, resolution):
-    """Expected UTC slots for one local meter day; 23/25h on DST transitions."""
-    start, end = _midnight(day, zone), _midnight(day + timedelta(days=1), zone)
+def _nominal_slot_count(start, end, resolution):
     if resolution == "DAY":
-        return {(start, end)}
+        return 1
     minutes = READ_MINUTES.get(resolution)
     if minutes is None:
         return None
@@ -533,7 +554,7 @@ def _expected_spans(day, zone, resolution):
     slots, remainder = divmod(end - start, step)
     if remainder:
         return None
-    return {(start + n * step, start + (n + 1) * step) for n in range(slots)}
+    return slots
 
 
 def _days(start, end):
@@ -549,10 +570,18 @@ def _day_coverage(series, zone, zone_known, resolution):
                 actual[bounds[0].astimezone(zone).date()].append(bounds)
 
     def coverage(day):
-        observed = actual[day]
-        expected = _expected_spans(day, zone, resolution) if zone_known else None
-        return (len(observed), len(expected) if expected is not None else None,
-                expected is not None and len(observed) == len(expected) and set(observed) == expected)
+        observed = sorted(actual[day])
+        start, end = _midnight(day, zone), _midnight(day + timedelta(days=1), zone)
+        nominal = _nominal_slot_count(start, end, resolution) if zone_known else None
+        if nominal is None:
+            return len(observed), None, False
+        cursor = start
+        for lo, hi in observed:
+            if lo != cursor or hi > end or ((lo, hi) != (start, end) and hi - lo not in INTERVAL_STEPS):
+                return len(observed), nominal, False
+            cursor = hi
+        complete = cursor == end
+        return len(observed), len(observed) if complete else nominal, complete
 
     return coverage
 
@@ -634,10 +663,14 @@ def _apply_bill_cost_modes(latest: dict[str, Any], manual_bills: list[dict[str, 
     latest["meter_change"] = {"date": bill.get("meter_change_date"), "old_meter_kwh": bill.get("old_meter_kwh"), "new_meter_kwh": bill.get("new_meter_kwh")}
 
 
+def _is_electricity_segment(row):
+    return str(row.get("serviceType") or "").strip().upper() in {"ELECTRIC", "ELECTRICITY"}
+
+
 def _latest_electricity_segment(bills, zone):
     # usageInterval is the segment's service period; timeInterval can be the
     # parent bill's issue period, which is not evidence of an electricity cutoff.
-    segments = [bounds for b in bills if str(b.get("serviceType") or "").strip().upper() in {"ELECTRIC", "ELECTRICITY"}
+    segments = [bounds for b in bills if _is_electricity_segment(b)
                 and (bounds := _bounds(b.get("usageInterval"), zone))]
     return max(segments, key=lambda v: (v[1], v[0]), default=None)
 
@@ -739,6 +772,57 @@ def _row_account(row):
     return row.get("utility_id") or row.get("account")
 
 
+def _point_id(row):
+    return row.get("service_point_uuid") or row.get("uuid")
+
+
+def _billing_scope(manifest, datasets, account, archive_manifests):
+    """Locate the selected meter and decide whether unassigned bills are safe."""
+    manifest = manifest or {}
+    scope = {"account": account, "utility_id": account, "service_point_uuid": _point_id(manifest)}
+    points = list(archive_manifests)
+    accounts = set()
+    for archived in archive_manifests:
+        inventory = archived.get("service_points")
+        if isinstance(inventory, list):
+            points.extend(point for point in inventory if isinstance(point, dict))
+        plans = archived.get("collection_windows")
+        if isinstance(plans, dict):
+            accounts.update(a for a, windows in plans.items() if a and windows)
+    points.extend(datasets.get("service_points", []))
+    points.extend(r for r in datasets.get("usage", []) if _net(r))
+    accounts.update(_row_account(r) for r in points if _row_account(r))
+    meters = {_point_id(r) for r in points if _point_id(r)}
+    selected = [r for r in points if account and _row_account(r) == account]
+    if not scope["service_point_uuid"]:
+        ids = {_point_id(r) for r in selected if _point_id(r)}
+        if len(ids) == 1:
+            scope["service_point_uuid"] = ids.pop()
+    meter = scope["service_point_uuid"]
+    candidates = [r for r in selected if not meter or _point_id(r) in {meter, None}]
+    ambiguous_agreement = False
+    for field in ("service_agreement_uuid", "service_agreement_urn"):
+        agreements = {r[field] for r in candidates if r.get(field)}
+        scope[field] = manifest.get(field) or (next(iter(agreements)) if len(agreements) == 1 else None)
+        ambiguous_agreement |= len(agreements) > 1
+    unambiguous = len(accounts) <= 1 and len(meters) <= 1 and not ambiguous_agreement
+    return scope, unambiguous
+
+
+def _bill_segment_belongs(row, scope, allow_unassigned):
+    owner = _row_account(row)
+    if owner and owner != scope["account"]:
+        return False
+    point = row.get("service_point_uuid")
+    if point and scope["service_point_uuid"] and point != scope["service_point_uuid"]:
+        return False
+    fields = ("service_agreement_uuid", "service_agreement_urn")
+    comparable = [field for field in fields if row.get(field) and scope[field]]
+    if comparable:
+        return all(row[field] == scope[field] for field in comparable)
+    return bool(owner or (point and point == scope["service_point_uuid"])) or allow_unassigned
+
+
 def _kind(row):
     return str(row.get("readType") or "").strip().upper()
 
@@ -774,8 +858,11 @@ def _merge_legacy(polls, zone):
             for row in datasets[dataset]:
                 key = _revision_key(dataset, row, zone)
                 prior = merged[dataset].get(key)
-                if dataset in {"usage", "cost", "pricing", "demand_maxima"} and prior and _kind(prior) == "ACTUAL" and _kind(row) != "ACTUAL":
-                    continue
+                if prior:
+                    if dataset == "usage" and _USAGE_RANK[_usage_source(prior)] > _USAGE_RANK[_usage_source(row)]:
+                        continue
+                    if dataset in {"cost", "pricing", "demand_maxima"} and _kind(prior) == "ACTUAL" and _kind(row) != "ACTUAL":
+                        continue
                 merged[dataset][key] = row
     return {dataset: list(rows.values()) for dataset, rows in merged.items()}
 
@@ -814,39 +901,48 @@ def _usage_source(row):
     return "actual" if kind == "ACTUAL" else "estimated" if kind in {"ESTIMATE", "ESTIMATED"} else "unknown"
 
 
-def _nonoverlapping_usage(usage, resolution, zone):
-    """Prefer the current cadence where it overlaps history at another cadence."""
+_USAGE_RANK = {"missing": 0, "unknown": 1, "estimated": 1, "actual": 2}
+
+
+def _nonoverlapping_usage(usage):
+    """Maximize non-overlapping usable coverage, then actual coverage, per meter.
+
+    With equal usable and actual coverage prefer more (finer) intervals.
+    Partial finer reads cannot replace a usable coarser interval and leave
+    a gap. Never split or prorate the reported energy of an interval.
+    """
     channels = defaultdict(list)
     for row, bounds in usage:
         channels[_channel(row)].append((row, bounds))
 
-    def preferred(bounds):
-        start, end = bounds
-        if resolution == "DAY":
-            day = start.astimezone(zone).date()
-            return start == _midnight(day, zone) and end == _midnight(day + timedelta(days=1), zone)
-        minutes = READ_MINUTES.get(resolution)
-        return minutes is not None and end - start == timedelta(minutes=minutes)
-
     for rows in channels.values():
-        rows.sort(key=lambda item: (item[1][0], -item[1][1].timestamp()))
-        primary = []
-        for row, bounds in rows:
-            if _float(row.get("value")) is not None and preferred(bounds) and (not primary or primary[-1][1][1] <= bounds[0]):
-                primary.append((row, bounds))
-        starts = [bounds[0] for _, bounds in primary]
-        previous_end = None
-        for row, (start, end) in rows:
-            i = bisect_left(starts, end)
-            if i and primary[i - 1][1][1] > start:
-                continue
-            if previous_end is None or previous_end <= start:
-                previous_end = end
-                yield row, (start, end)
-        yield from primary
+        rows.sort(key=lambda item: (item[1][1], item[1][0]))
+        ends = [bounds[1] for _, bounds in rows]
+        scores = [(0, 0, 0, 0)]
+        predecessors = []
+        for i, (row, (start, end)) in enumerate(rows):
+            previous = bisect_right(ends, start, hi=i)
+            usable, actual, total, count = scores[previous]
+            length = (end - start) // timedelta(microseconds=1)
+            quality = _USAGE_RANK[_usage_source(row)]
+            take = (usable + (length if quality else 0), actual + (length if quality == 2 else 0), total + length, count + 1)
+            if take > scores[-1]:
+                scores.append(take)
+                predecessors.append(previous)
+            else:
+                scores.append(scores[-1])
+                predecessors.append(None)
+        i = len(rows)
+        while i:
+            previous = predecessors[i - 1]
+            if previous is None:
+                i -= 1
+            else:
+                yield rows[i - 1]
+                i = previous
 
 
-def _build_meter_summary(manifest, datasets, account):
+def _build_meter_summary(manifest, datasets, account, bill_scope, allow_unassigned_bills):
     service_points = datasets["service_points"] or manifest.get("service_points") or []
     zone_name = manifest.get("timezone")
     if not zone_name:
@@ -855,6 +951,10 @@ def _build_meter_summary(manifest, datasets, account):
 
     def belongs(row):
         return not account or not _row_account(row) or _row_account(row) == account
+
+    def selected_usage(row):
+        point = bill_scope["service_point_uuid"]
+        return belongs(row) and (not point or _point_id(row) in {point, None})
 
     def measurements(rows):
         for row in rows:
@@ -923,7 +1023,7 @@ def _build_meter_summary(manifest, datasets, account):
 
     point_totals = defaultdict(list)
     series = []
-    for r, bounds in sorted(_nonoverlapping_usage(usage, manifest.get("resolution"), zone), key=lambda item: item[1]):
+    for r, bounds in sorted(_nonoverlapping_usage(usage), key=lambda item: item[1]):
         channel = _channel(r)
         key = channel, bounds
         kwh = _float(r.get("value"))
@@ -940,7 +1040,7 @@ def _build_meter_summary(manifest, datasets, account):
             cost_source = "missing"
         detail = interval_details(r, bounds)
         point_totals[channel].append((bounds[0].astimezone(zone), kwh, cost))
-        if not belongs(r):
+        if not selected_usage(r):
             continue
         effective = _safe_rate(cost, kwh)
         if price is None and effective is not None and key not in price_series:
@@ -1003,8 +1103,16 @@ def _build_meter_summary(manifest, datasets, account):
 
     daily, hourly = aggregate("date"), aggregate("hour")
     bill_history = []
+    # A legacy collection may omit its selected agreement. A lone electricity
+    # agreement can be used in an otherwise unambiguous archive; several
+    # unmapped agreements are not interchangeable.
+    if not (bill_scope["service_agreement_uuid"] or bill_scope["service_agreement_urn"]):
+        electricity = [r for r in datasets["bills"] if _is_electricity_segment(r) and belongs(r)]
+        if any(len({r[field] for r in electricity if r.get(field)}) > 1
+               for field in ("service_agreement_uuid", "service_agreement_urn")):
+            allow_unassigned_bills = False
     for r in datasets["bills"]:
-        if not belongs(r):
+        if not _bill_segment_belongs(r, bill_scope, allow_unassigned_bills):
             continue
         interval = r.get("usageInterval") or r.get("timeInterval")
         bounds = _bounds(interval, zone)
@@ -1032,7 +1140,7 @@ def _build_meter_summary(manifest, datasets, account):
     for r in datasets["usage"]:
         if belongs(r):
             read_types[_kind(r) or "unknown"] += 1
-    actual_end = max((bounds[1] for r, bounds in usage if belongs(r) and _usage_source(r) == "actual"), default=None)
+    actual_end = max((bounds[1] for r, bounds in usage if selected_usage(r) and _usage_source(r) == "actual"), default=None)
     baseload = _baseload(hourly[-HOURLY_POINTS:], effective)
     summary = {**_poll_summary(manifest, datasets), "manifest": manifest, "account": account,
                "timezone": zone.key, "meter_zone_known": zone_known,
@@ -1064,7 +1172,9 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
     manifest, datasets = _legacy_poll(run_dir)
     zone, _ = _meter_zone(manifest.get("timezone"))
     datasets = _merge_legacy([(manifest, datasets)], zone)
-    summary, _, _ = _build_meter_summary(manifest, datasets, manifest.get("account"))
+    account = _row_account(manifest)
+    scope, unambiguous = _billing_scope(manifest, datasets, account, [manifest])
+    summary, _, _ = _build_meter_summary(manifest, datasets, account, scope, unambiguous)
     return {**summary, "run_dir": str(run_dir.resolve())}
 
 
@@ -1075,28 +1185,30 @@ def _get_dashboard_inputs(data_dir, db_path, account):
         with History(Path(db_path)) as history:
             manifest = history.latest_manifest(account)
             if manifest is None:
-                return None, [], {}, account
+                return None, [], {}, account, []
             account = account or manifest.get("account") or manifest.get("utility_id")
             manifests = history.manifests(account)
+            archive_manifests = history.manifests() if account else manifests
             if not account:
                 # Never ask SQLite to combine readings for unrelated accounts.
-                return manifest, [_poll_summary(m) for m in manifests], {name: [] for name in DATASETS}, account
+                return manifest, [_poll_summary(m) for m in manifests], {name: [] for name in DATASETS}, account, archive_manifests
             datasets = {name: history.rows(name, account) for name in DATASETS}
-        return manifest, [_poll_summary(m) for m in manifests], datasets, account
+        return manifest, [_poll_summary(m) for m in manifests], datasets, account, archive_manifests
 
     # Legacy preview only. Merge intervals, not daily snapshots, so an
     # overlapping capped poll cannot turn a full day into a partial day.
     paths = sorted(p for p in data_dir.iterdir() if p.is_dir() and (p / "manifest.json").is_file()) if data_dir.is_dir() else []
     polls = [(path, *_legacy_poll(path)) for path in paths]
     polls.sort(key=lambda p: _instant(p[1].get("retrieved_at_utc"), timezone.utc) or datetime.min.replace(tzinfo=timezone.utc))
+    archive_manifests = [m for _, m, _ in polls]
     if not polls:
-        return None, [], {}, account
+        return None, [], {}, account, archive_manifests
     _, last, _ = polls[-1]
     account = account or last.get("account") or last.get("utility_id")
     if account:
         polls = [p for p in polls if (p[1].get("account") or p[1].get("utility_id")) == account]
     if not polls:
-        return None, [], {}, account
+        return None, [], {}, account, archive_manifests
     _, manifest, _ = polls[-1]
     zone, _ = _meter_zone(manifest.get("timezone"))
     summaries = []
@@ -1105,28 +1217,35 @@ def _get_dashboard_inputs(data_dir, db_path, account):
         net_rows = [r for r in rows["usage"] if _net(r) and (not account or _row_account(r) == account)]
         summary["total_net_kwh"] = _sum_known(_float(r.get("value")) for r in net_rows)
         summaries.append(summary)
-    return manifest, summaries, _merge_legacy([(m, rows) for _, m, rows in polls], zone), account
+    return manifest, summaries, _merge_legacy([(m, rows) for _, m, rows in polls], zone), account, archive_manifests
 
 
 def build_dashboard_data(data_dir: Path = Path("data"), *, db_path: Path | None = None,
                          account: str | None = None, manual_bill_dir: Path | None = None,
+                         manual_bill_account: str | None = None,
                          benchmark_prices: list[dict[str, Any]] | None = None,
                          fetch_eia: bool = False, as_of: datetime | None = None) -> dict[str, Any]:
     """Read canonical history if selected; otherwise preview legacy CSVs.
 
-    Manual statements are opt-in and must belong to the selected account.
+    Manual statements are opt-in. JSON may assign them to a selectable meter
+    with account/utility_id, a service-point UUID, or a service agreement ID;
+    the printed invoice account number is not that assignment. Unassigned bills
+    require an unambiguous archive or an explicit manual_bill_account scope.
     EIA is offline by default. Pass an aware as_of for reproducible forecasts;
     otherwise staleness is checked against the current meter-local calendar day.
     """
     data_dir = Path(data_dir)
     if as_of is not None and as_of.utcoffset() is None:
         raise ValueError("as_of must be timezone-aware")
-    manifest, runs, datasets, account = _get_dashboard_inputs(data_dir, db_path, account)
+    manifest, runs, datasets, account, archive_manifests = _get_dashboard_inputs(data_dir, db_path, account)
+    scope, unambiguous = _billing_scope(manifest, datasets, account, archive_manifests)
     latest = None
     prices, events, bill_history, hourly_profile = [], [], [], []
-    manual_bills = _load_manual_bills(Path(manual_bill_dir)) if manual_bill_dir is not None else []
+    allow_unassigned = (unambiguous and (manifest is not None or account is None)
+                        if manual_bill_account is None else manifest is not None and manual_bill_account == account)
+    manual_bills = _load_manual_bills(Path(manual_bill_dir), scope, allow_unassigned) if manual_bill_dir is not None else []
     if manifest is not None:
-        latest, prices, events = _build_meter_summary(manifest, datasets, account)
+        latest, prices, events = _build_meter_summary(manifest, datasets, account, scope, unambiguous)
         zone, _ = _meter_zone(latest["timezone"])
         coverage = _day_coverage(latest["series"], zone, latest["meter_zone_known"], latest["resolution"])
         latest["bill_reconciliation"] = _bill_reconciliation(latest, manual_bills, coverage)
@@ -1213,7 +1332,8 @@ def _shareable_html(data):
 
 def generate_dashboard(data_dir: Path = Path("data"), output: Path = Path(DASHBOARD_PATH), split_data: bool = False,
                        *, db_path: Path | None = None, account: str | None = None, shareable: bool = False,
-                       manual_bill_dir: Path | None = None, benchmark_prices: list[dict[str, Any]] | None = None,
+                       manual_bill_dir: Path | None = None, manual_bill_account: str | None = None,
+                       benchmark_prices: list[dict[str, Any]] | None = None,
                        fetch_eia: bool = False, as_of: datetime | None = None) -> Path:
     """Publish offline HTML atomically. Split mode retains immutable JS companions.
 
@@ -1223,7 +1343,8 @@ def generate_dashboard(data_dir: Path = Path("data"), output: Path = Path(DASHBO
     """
     output = Path(output)
     data = build_dashboard_data(data_dir, db_path=db_path, account=account, manual_bill_dir=manual_bill_dir,
-                                benchmark_prices=benchmark_prices, fetch_eia=fetch_eia, as_of=as_of)
+                                manual_bill_account=manual_bill_account, benchmark_prices=benchmark_prices,
+                                fetch_eia=fetch_eia, as_of=as_of)
     if shareable:
         html = _shareable_html(data)
     else:

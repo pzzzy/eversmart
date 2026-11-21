@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 import re
+import stat
 import tempfile
 import urllib.error
 from contextlib import contextmanager
@@ -47,8 +48,15 @@ def make_private_directory(path: Path) -> None:
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
+def require_private_directory(path: Path) -> None:
+    make_private_directory(path)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise LocalError("Use an owned, non-symlink state directory with permissions 0700.")
+
+
 @contextmanager
-def atomic_destination(path: Path) -> Iterator[Path]:
+def atomic_destination(path: Path, *, replace: bool = True) -> Iterator[Path]:
     """Stage in the destination directory so replacement is a single rename."""
     fd, name = tempfile.mkstemp(prefix=".eversmart-", suffix=path.suffix, dir=path.parent)
     os.close(fd)
@@ -58,7 +66,13 @@ def atomic_destination(path: Path) -> Iterator[Path]:
         staged.chmod(0o600)
         with staged.open("rb") as stream:
             os.fsync(stream.fileno())
-        os.replace(staged, path)
+        if replace:
+            os.replace(staged, path)
+        else:
+            try:
+                os.link(staged, path, follow_symlinks=False)
+            except FileExistsError:
+                raise LocalError("The export destination already exists; choose a new file.") from None
     finally:
         staged.unlink(missing_ok=True)
 

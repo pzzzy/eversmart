@@ -2,6 +2,7 @@
 
 import csv
 import json
+import sqlite3
 import stat
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
+from zoneinfo import ZoneInfo
 
 import history
 
@@ -85,6 +87,36 @@ class HistoryTests(unittest.TestCase):
             for sidecar in self.db.parent.glob("history.sqlite-*"):
                 self.assertEqual(stat.S_IMODE(sidecar.stat().st_mode), 0o600)
 
+    def test_existing_database_is_restricted_before_opening_wal(self):
+        self.db.parent.mkdir(parents=True)
+        self.db.touch(mode=0o644)
+        with history.History(self.db):
+            self.assertEqual(stat.S_IMODE(self.db.stat().st_mode), 0o600)
+            for suffix in ("-wal", "-shm"):
+                self.assertEqual(stat.S_IMODE(self.db.with_name(self.db.name + suffix).stat().st_mode), 0o600)
+
+    def test_database_parent_database_file_and_sidecars_cannot_be_symlinks(self):
+        self.db.parent.mkdir(parents=True)
+        target = self.root / "untouched"
+        target.write_text("unchanged", encoding="utf-8")
+        target.chmod(0o644)
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            with self.subTest(suffix=suffix):
+                link = self.db.with_name(self.db.name + suffix)
+                link.symlink_to(target)
+                try:
+                    with self.assertRaises(OSError), history.History(self.db):
+                        self.fail("opened a linked database artifact")
+                    self.assertEqual(target.read_text(encoding="utf-8"), "unchanged")
+                    self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+                finally:
+                    link.unlink(missing_ok=True)
+        alias = self.root / "alias"
+        alias.symlink_to(self.db.parent, target_is_directory=True)
+        with self.assertRaises(OSError), history.History(alias / "nested" / "unexpected.sqlite"):
+            self.fail("opened a database through a linked directory")
+        self.assertFalse((self.db.parent / "nested").exists())
+
     def test_finalized_same_second_collector_runs_are_independently_recoverable(self):
         _, first = self.run_fixture(usage=[reading()])
         second_dir, second = self.run_fixture(
@@ -96,6 +128,18 @@ class HistoryTests(unittest.TestCase):
             self.assertEqual(h.manifests(), [first, second])
             self.assertEqual(h.rows("usage", ACCOUNT), [reading(value="2.0")])
             self.assertFalse(h.ingest_run(second_dir))
+
+    def test_same_second_revision_order_uses_manifest_microseconds_not_suffix(self):
+        _, legacy = self.run_fixture(usage=[reading(value="1")])
+        early = self.run_fixture(STAMP + ".zzzzzzzz", usage=[reading(value="2")],
+                                 manifest={"retrieved_at_utc": "2026-03-12T12:00:00.123456Z"})[1]
+        late = self.run_fixture(STAMP + ".aaaaaaaa", usage=[reading(value="3")],
+                                manifest={"retrieved_at_utc": "2026-03-12T12:00:00.123457+00:00"})[1]
+        with history.History(self.db) as h:
+            self.assertEqual(h.ingest_archive(self.archive), 3)
+            self.assertEqual(h.manifests(), [legacy, early, late])
+            self.assertEqual(h.latest_manifest(), late)
+            self.assertEqual(h.rows("usage", ACCOUNT), [reading(value="3")])
 
     def test_parallel_import_commits_run_once(self):
         run, _ = self.run_fixture(usage=[reading()])
@@ -122,6 +166,37 @@ class HistoryTests(unittest.TestCase):
             (run / "weather.csv").unlink()
             self.assertTrue(h.ingest_run(run))
 
+    def test_archive_skips_bad_runs_counts_them_once_and_retries_after_repair(self):
+        current = {"archive_format": 1, "poll_status": "collected",
+                   "collection_windows": {ACCOUNT: [INTERVAL]}, "usage_rows": 1}
+        malformed, _ = self.run_fixture(usage=[reading()], manifest=current)
+        (malformed / "weather.csv").write_text('premise_uuid,timeInterval\n"unclosed', encoding="utf-8")
+        missing, _ = self.run_fixture("20260312T120001Z", manifest=current)
+        truncated, _ = self.run_fixture("20260312T120002Z", manifest=current, usage=[])
+        invalid_header, _ = self.run_fixture("20260312T120003Z", manifest={**current, "usage_rows": 0}, usage=[])
+        (invalid_header / "usage.csv").write_text("unexpected,header\n", encoding="utf-8")
+        short_row, _ = self.run_fixture("20260312T120004Z", manifest=current, usage=[reading()])
+        usage_path = short_row / "usage.csv"
+        lines = usage_path.read_text(encoding="utf-8").splitlines()
+        usage_path.write_text(lines[0] + "\n" + lines[1].rsplit(",", 1)[0] + "\n", encoding="utf-8")
+        # The unversioned count is advisory, even if it differs from the CSV.
+        _, legacy = self.run_fixture("20260313T120000Z", manifest={"usage_rows": 99}, usage=[reading(value="2")])
+        _, prior_format = self.run_fixture("20260313T120001Z", usage=[reading(value="2")],
+                                          manifest={"poll_status": "collected", "collection_windows": {}, "usage_rows": 99})
+        with history.History(self.db) as h:
+            self.assertEqual(h.ingest_archive(self.archive), 2)
+            self.assertEqual(h.archive_failures, 5)
+            self.assertEqual(h.manifests(), [legacy, prior_format])
+            self.assertEqual(h.rows("usage", ACCOUNT), [reading(value="2")])
+            (malformed / "weather.csv").unlink()
+            for run in (missing, truncated, short_row):
+                write_csv(run, "usage", [reading()])
+            (invalid_header / "usage.csv").write_text("utility_id,timeInterval,stream,value\n", encoding="utf-8")
+            self.assertEqual(h.ingest_archive(self.archive), 5)
+            self.assertEqual(h.archive_failures, 0)
+            self.assertEqual(h.ingest_archive(self.archive), 0)
+            self.assertEqual(h.rows("usage", ACCOUNT), [reading(value="2")])
+
     def test_canonical_identity_uses_utc_service_point_stream_quantity_and_both_endpoints(self):
         equivalent = reading(timeInterval="2026-03-10T08:00:00-04:00/2026-03-10T08:15:00-04:00", value="2.00")
         changed = [reading(service_point_uuid="secondary-sp", utility_id="second"), reading(stream="demand"),
@@ -132,7 +207,8 @@ class HistoryTests(unittest.TestCase):
         with history.History(self.db) as h:
             self.assertTrue(h.ingest_run(second))
             self.assertTrue(h.ingest_run(first))
-            self.assertCountEqual(h.rows("usage", ACCOUNT), [equivalent, *changed])
+            self.assertCountEqual(h.rows("usage", ACCOUNT), [equivalent, *changed[1:]])
+            self.assertEqual(h.rows("usage", "second"), [changed[0]])
             self.assertEqual(h.rows("usage", ACCOUNT, utc("2026-03-10T12:15"), utc("2026-03-10T12:31")), [changed[-1]])
             self.assertEqual(h.rows("usage", "other"), [])
 
@@ -268,6 +344,95 @@ class HistoryTests(unittest.TestCase):
             self.assertEqual(h.coverage(secondary, "QUARTER_HOUR"),
                              [(utc("2026-03-10T12:00"), utc("2026-03-10T12:15"))])
 
+    def test_secondary_history_is_scoped_to_the_actual_meter_not_inventory(self):
+        secondary, sibling, planned = "meter-b", "meter-c", "meter-d"
+        points = [{"account": secondary, "service_point_uuid": "secondary-sp", "timezone": "America/Chicago",
+                   "available_interval": "2026-03-01/2026-04-01", "resolution": "HOUR", "premise_uuid": "premise-b"},
+                  {"account": sibling, "service_point_uuid": "sibling-sp", "premise_uuid": "premise-c"},
+                  {"account": planned, "service_point_uuid": "planned-sp"}]
+        second_read = reading(utility_id="", service_point_uuid="secondary-sp", value="2")
+        primary_bill = {"bill_urn": "bill-primary", "currentAmount": "10", "utility_id": secondary}
+        weather = {"premise_uuid": "premise-b", "date": "2026-03-10", "mean_temperature": "32"}
+        _, first = self.run_fixture(manifest={"service_points": points, "errors": {"pricing": "unavailable"},
+                                              "collection_windows": {ACCOUNT: [INTERVAL], planned: [INTERVAL], sibling: []}},
+                                    usage=[reading(), second_read], cost=[reading(), second_read], pricing=[second_read],
+                                    demand_maxima=[second_read], service_points=points, bills=[primary_bill], weather=[weather])
+        _, newer = self.run_fixture("20260313T120000Z", manifest={"service_points": points},
+                                    usage=[reading(value="3")], service_points=points)
+        with history.History(self.db) as h:
+            self.assertEqual(h.ingest_archive(self.archive), 2)
+            self.assertEqual(h.manifests(), [first, newer])
+            self.assertEqual(h.latest_manifest(ACCOUNT), newer)
+            self.assertEqual(h.rows("usage", ACCOUNT), [reading(value="3")])
+            for dataset in ("usage", "cost", "pricing", "demand_maxima"):
+                self.assertEqual(h.rows(dataset, secondary), [second_read])
+            self.assertEqual(h.rows("weather", secondary), [weather])
+            self.assertEqual(h.rows("weather", ACCOUNT), [])
+            self.assertEqual(h.rows("bills", ACCOUNT), [primary_bill])
+            self.assertEqual(h.rows("bills", secondary), [])
+            self.assertEqual(h.rows("service_points", secondary), [points[0]])
+            self.assertIsNone(h.latest_manifest(sibling))
+            self.assertIsNotNone(h.latest_manifest(planned))
+            meta, = h.manifests(secondary)
+            self.assertEqual(h.latest_manifest(secondary), meta)
+            self.assertEqual(meta["account"], secondary)
+            self.assertEqual(meta["timezone"], "America/Chicago")
+            self.assertEqual(meta["latest_available_end"], "2026-04-01")
+            self.assertEqual(meta["errors"], first["errors"])
+            self.assertEqual(meta["service_points"], points)
+
+    def test_secondary_usage_is_successful_even_if_primary_did_not_poll_usage(self):
+        secondary, other = "meter-b", "meter-c"
+        member = reading(utility_id=secondary, service_point_uuid="point-b")
+        _, run = self.run_fixture(usage=[member], manifest={
+            "poll_status": "no_op", "success": False, "primary_usage_rows": 0, "usage_rows": 1,
+            "collection_windows": {ACCOUNT: [], secondary: [INTERVAL], other: [INTERVAL]},
+        })
+        with history.History(self.db) as h:
+            self.assertEqual(h.ingest_archive(self.archive), 1)
+            self.assertEqual(h.latest_manifest(ACCOUNT), run)
+            _, b, c = (h.latest_manifest(a) or {} for a in (ACCOUNT, secondary, other))
+            self.assertEqual((b["poll_status"], b["success"], b["usage_rows"]), ("collected", True, 1))
+            self.assertEqual((c["poll_status"], c["success"], c["usage_rows"]), ("no_op", False, 0))
+
+    def test_existing_db_migrates_without_archive_and_can_reindex_archived_runs(self):
+        secondary = "meter-b"
+        points = [{"account": secondary, "service_point_uuid": "secondary-sp", "timezone": "America/Chicago"}]
+        row = reading(utility_id="", service_point_uuid="secondary-sp",
+                      timeInterval="2026-03-10T07:00/2026-03-10T07:15")
+        _, manifest = self.run_fixture(service_points=points, usage=[reading(), row])
+        self.db.parent.mkdir(parents=True)
+        timestamp = "2026-03-12T12:00:00.000000Z"
+        with sqlite3.connect(self.db) as db:
+            # Pre-review schema and a real legacy row keyed by poll primary.
+            db.executescript("""
+                CREATE TABLE runs (account TEXT NOT NULL, retrieved TEXT NOT NULL, manifest TEXT NOT NULL,
+                                   PRIMARY KEY (account, retrieved)) WITHOUT ROWID;
+                CREATE TABLE readings (account TEXT NOT NULL, dataset TEXT NOT NULL, identity TEXT NOT NULL,
+                    start_utc TEXT, end_utc TEXT, cadence TEXT, net_account TEXT, rank INTEGER NOT NULL,
+                    retrieved TEXT NOT NULL, seq INTEGER NOT NULL, payload TEXT NOT NULL, field_versions TEXT NOT NULL,
+                    PRIMARY KEY (account, dataset, identity)) WITHOUT ROWID;
+            """)
+            db.execute("INSERT INTO runs VALUES (?, ?, ?)", (ACCOUNT, timestamp, json.dumps(manifest)))
+            lo, hi = "2026-03-10T11:00:00.000000Z", "2026-03-10T11:15:00.000000Z"
+            identity = json.dumps(["uuid", "secondary-sp", "netUsage", "NET_USAGE", lo, hi], separators=(",", ":"))
+            versions = {field: [2 if field == "value" else 5, timestamp, 1] for field in row if row[field]}
+            db.execute("INSERT INTO readings VALUES (?, 'usage', ?, ?, ?, 'QUARTER_HOUR', NULL, 5, ?, 1, ?, ?)",
+                       (ACCOUNT, identity, lo, hi, timestamp, json.dumps(row), json.dumps(versions)))
+            db.execute("INSERT INTO readings VALUES (?, 'service_points', ?, NULL, NULL, NULL, NULL, 4, ?, 0, ?, '{}')",
+                       (ACCOUNT, '["uuid","secondary-sp"]', timestamp, json.dumps(points[0])))
+        with history.History(self.db) as h:
+            self.assertEqual(h.rows("usage", ACCOUNT), [])
+            self.assertEqual(h.rows("usage", secondary), [row])
+            self.assertEqual((h.latest_manifest(secondary) or {})["account"], secondary)
+            self.assertEqual(h.coverage(secondary, "QUARTER_HOUR"), [(utc("2026-03-10T12:00"), utc("2026-03-10T12:15"))])
+            self.assertEqual(h.ingest_archive(self.archive), 1)
+            self.assertEqual(h.ingest_archive(self.archive), 0)
+        with history.History(self.db) as h:
+            self.assertEqual(h.rows("usage", ACCOUNT), [reading()])
+            self.assertEqual(h.rows("usage", secondary), [row])
+            self.assertEqual(h.manifests(), [manifest])
+
 
 class PlanWindowsTests(unittest.TestCase):
     def test_default_without_coverage_only_requests_latest_720_hours(self):
@@ -338,6 +503,34 @@ class PlanWindowsTests(unittest.TestCase):
         partial = (utc("2026-03-09T05:00"), utc("2026-03-10T03:00"))
         self.assertEqual(history.plan_windows(available, "DAY", [partial], backfill=True),
                          ["2026-03-08T05:00:00Z/2026-03-11T04:00:00Z"])
+
+    def test_daily_planner_uses_calendar_midnights_across_both_dst_transitions(self):
+        zone = "America/New_York"
+        for available, expected in [
+            ("2026-02-22/2026-04-25", ["2026-02-22T05:00:00Z/2026-03-24T04:00:00Z",
+                                       "2026-03-24T04:00:00Z/2026-04-23T04:00:00Z",
+                                       "2026-04-23T04:00:00Z/2026-04-25T04:00:00Z"]),
+            ("2026-10-20/2026-12-22", ["2026-10-20T04:00:00Z/2026-11-18T05:00:00Z",
+                                       "2026-11-18T05:00:00Z/2026-12-18T05:00:00Z",
+                                       "2026-12-18T05:00:00Z/2026-12-22T05:00:00Z"]),
+        ]:
+            with self.subTest(available=available):
+                self.assertEqual(history.plan_windows(available, "DAY", [], backfill=True, timezone=zone), expected)
+                self.assertEqual(history.plan_explicit_windows(available, "DAY", timezone=ZoneInfo(zone)), expected)
+
+    def test_daily_refresh_chooses_the_latest_full_days_within_720_hours(self):
+        self.assertEqual(history.plan_windows("2026-09-01/2026-11-16", "DAY", [], timezone="America/New_York"),
+                         ["2026-10-18T04:00:00Z/2026-11-16T05:00:00Z"])
+
+    def test_daily_backfill_subtracts_full_local_days_inside_a_partial_range(self):
+        covered = [(utc("2026-10-31T05:00"), utc("2026-11-02T06:00"))]
+        self.assertEqual(history.plan_windows("2026-10-30/2026-11-04", "DAY", covered, backfill=True,
+                                              timezone="America/New_York"),
+                         ["2026-10-30T04:00:00Z/2026-11-01T04:00:00Z", "2026-11-02T05:00:00Z/2026-11-04T05:00:00Z"])
+
+    def test_explicit_subdaily_range_preserves_requested_bounds(self):
+        self.assertEqual(history.plan_explicit_windows("2026-01-01T01:25-05:00/2026-02-03T08:15+01:00", "HOUR"),
+                         ["2026-01-01T06:25:00Z/2026-01-31T06:25:00Z", "2026-01-31T06:25:00Z/2026-02-03T07:15:00Z"])
 
 
 if __name__ == "__main__":

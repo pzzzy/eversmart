@@ -21,6 +21,20 @@ SECRET = 'synthetic-upstream-secret'
 EMPTY = {'data': {'billingAccountByAuthContext': {'serviceAgreementsConnection': {'edges': []}}}}
 
 
+def usage_doc(target, interval, resolution, value=1.25):
+    start, stop = map(datetime.fromisoformat, interval.split('/'))
+    length = {'QUARTER_HOUR': 15, 'HALF_HOUR': 30, 'HOUR': 60, 'DAY': 1440}[resolution]
+    end = min(stop, start + timedelta(minutes=length))
+    point = {'uuid': target.service_point_uuid, 'utilityId': target.account, 'readStreams': {'netUsage': [{
+        'serviceQuantityIdentifier': 'NET_USAGE', 'unit': 'KWH', 'reads': [
+            {'timeInterval': f'{start.isoformat()}/{end.isoformat()}', 'readType': 'ACTUAL',
+             'measuredAmount': {'value': value}},
+        ],
+    }]}}
+    agreement = {'node': {'uuid': target.service_agreement_uuid, 'servicePointsConnection': {'edges': [{'node': point}]}}}
+    return {'data': {'billingAccountByAuthContext': {'serviceAgreementsConnection': {'edges': [agreement]}}}}
+
+
 class FakeClient:
     def __init__(self):
         self.calls = []
@@ -34,7 +48,7 @@ class FakeClient:
 
     def usage(self, target, interval, resolution):
         self.calls.append((target.account, interval, resolution))
-        return EMPTY
+        return usage_doc(target, interval, resolution)
 
     def cost(self, *args):
         return EMPTY
@@ -96,12 +110,26 @@ class CollectionReliabilityTests(unittest.TestCase):
         run = self.history.ingested[0]
         self.assertEqual(stat.S_IMODE(run.stat().st_mode), 0o700)
         self.assertEqual(len(list(run.glob('usage_*.json.gz'))), 3)
-        for raw in run.glob('usage_*.json.gz'):
+        for raw, window in zip(sorted(run.glob('usage_*.json.gz')), windows, strict=True):
             with gzip.open(raw, 'rt') as stream:
-                self.assertEqual(json.load(stream), EMPTY)
+                self.assertEqual(json.load(stream), usage_doc(self.client.targets[0], window, 'HOUR'))
         self.assertTrue((run / 'usage.csv').exists())
         self.assertEqual(result['collection_windows']['meter'], windows)
         self.assertEqual(self.output.read_text(), 'fresh')
+
+    def test_explicit_daily_collection_splits_at_meter_local_midnights(self):
+        from zoneinfo import ZoneInfo
+
+        zone = ZoneInfo('America/New_York')
+        target = self.client.targets[0]
+        target.timezone, target.resolution = zone.key, 'DAY'
+        self.collect('2026-02-15T00:00:00-05:00/2026-04-01T00:00:00-04:00')
+        self.assertEqual(len(self.client.calls), 2)
+        for _, interval, _ in self.client.calls:
+            a, b = map(datetime.fromisoformat, interval.split('/'))
+            self.assertLessEqual(b - a, timedelta(hours=720))
+            for boundary in (a, b):
+                self.assertEqual(boundary.astimezone(zone).strftime('%H:%M'), '00:00')
 
     def test_required_failure_does_not_publish_or_ingest_a_partial_run(self):
         def fail(*args):
@@ -125,7 +153,7 @@ class CollectionReliabilityTests(unittest.TestCase):
                     app.collect_once(FakeClient(), self.out, 'meter', interval, resolution,
                                      history=FakeHistory(), db_path=self.root / 'different.sqlite',
                                      output=self.output, renderer=self.renderer)
-            return EMPTY
+            return usage_doc(target, interval, resolution)
 
         self.client.usage = usage
         self.collect(AVAILABLE)
@@ -240,17 +268,19 @@ class CollectionReliabilityTests(unittest.TestCase):
 
     def test_shareable_only_does_not_initialize_client_or_publish_live_dashboard(self):
         artifact = self.root / 'export.html'
-        status = self.root / 'status.json'
+        state = self.root / 'state'
+        state.mkdir(mode=0o700)
+        status = state / 'status.json'
         status.write_text('existing live status')
         calls = []
         def renderer(data_dir, output, **kwargs):
             calls.append(kwargs)
             output.write_text('redacted')
         with patch.object(app, 'EversourceClient', side_effect=AssertionError('unexpected login')), redirect_stdout(io.StringIO()):
-            self.assertEqual(app.main(['--state-dir', str(self.root), '--shareable', str(artifact)], renderer=renderer), 0)
+            self.assertEqual(app.main(['--state-dir', str(state), '--shareable', str(artifact)], renderer=renderer), 0)
         self.assertEqual(artifact.read_text(), 'redacted')
         self.assertTrue(calls[0]['shareable'])
-        self.assertFalse((self.root / 'dashboard.html').exists())
+        self.assertFalse((state / 'dashboard.html').exists())
         self.assertEqual(status.read_text(), 'existing live status')
 
     def test_cli_render_failure_has_nonzero_sanitized_result(self):
@@ -271,11 +301,12 @@ class CollectionReliabilityTests(unittest.TestCase):
             run = self.out / f'2026010{index}T120000Z'
             run.mkdir(parents=True)
             (run / 'manifest.json').write_text(json.dumps({'account': account, 'retrieved_at_utc': run.name}))
-        with History(self.root / 'history.sqlite') as history:
+        state = self.root / 'state'
+        with History(state / 'history.sqlite') as history:
             self.assertEqual(history.ingest_archive(self.out), 2)
         artifact = self.root / 'export.html'
         with redirect_stderr(io.StringIO()) as log:
-            self.assertEqual(app.main(['--shareable', str(artifact)]), 1)
+            self.assertEqual(app.main(['--state-dir', str(state), '--shareable', str(artifact)]), 1)
         self.assertIn('--account', log.getvalue())
         self.assertFalse(artifact.exists())
 

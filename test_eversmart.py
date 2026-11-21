@@ -390,6 +390,7 @@ class EversmartParserTests(OfflineTestCase):
 
     def test_collect_once_does_not_mark_noncritical_rate_plan_502_as_error(self):
         from eversmart import Target
+        from test_collection_reliability import usage_doc
         target = Target(
             account="acct", entity_id="entity", service_agreement_uuid="sa", service_point_uuid="sp",
             available_interval="2026-01-01T00:00:00-05:00/2026-01-02T00:00:00-05:00", resolution="DAY",
@@ -402,12 +403,19 @@ class EversmartParserTests(OfflineTestCase):
         class FakeClient:
             def metadata(self): return {"data": {"billingAccountByAuthContext": {}}}
             def service_points(self, metadata): return [target]
-            def usage(self, *args): return {"data": {"billingAccountByAuthContext": {"serviceAgreementsConnection": {"edges": []}}}}
+            def usage(self, target, interval, resolution): return usage_doc(target, interval, resolution)
             cost = usage
             pricing = usage
-            demand_maxima = usage
-            weather = usage
-            bills = usage
+            def demand_maxima(self, target, interval):
+                doc = usage_doc(target, interval, target.resolution)
+                node = doc['data']['billingAccountByAuthContext']['serviceAgreementsConnection']['edges'][0]['node']
+                node['servicePointsConnection']['edges'][0]['node']['readStreams'] = {'demand': []}
+                return doc
+            def weather(self, target, interval):
+                return {'data': {'billingAccountByAuthContext': {'premisesConnection': {
+                    'edges': [{'node': {'uuid': target.premise_uuid, 'weather': []}}],
+                }}}}
+            def bills(self, target): return {'data': {'billingAccountByAuthContext': {'bills': []}}}
             def forecast(self, *args): raise RuntimeError("optional forecast failure")
             def rate_static_content(self, *args):
                 raise RuntimeError("Opower GraphQL HTTP 502: Bad Gateway")
@@ -419,6 +427,7 @@ class EversmartParserTests(OfflineTestCase):
 
     def test_collect_once_plans_one_safe_window_for_regular_poll(self):
         from eversmart import Target
+        from test_collection_reliability import usage_doc
         target = Target(
             account="acct", entity_id="entity", service_agreement_uuid="sa", service_point_uuid="sp",
             available_interval="2026-06-03T00:00:00-04:00/2026-07-04T00:00:00-04:00", resolution="QUARTER_HOUR",
@@ -434,7 +443,7 @@ class EversmartParserTests(OfflineTestCase):
             def service_points(self, metadata): return [target]
             def usage(self, target, interval, resolution):
                 calls.append(interval)
-                return {"data": {"billingAccountByAuthContext": {"serviceAgreementsConnection": {"edges": []}}}}
+                return usage_doc(target, interval, resolution)
             cost = usage
             pricing = usage
             def demand_maxima(self, *args): return {"data": {"billingAccountByAuthContext": {"serviceAgreementsConnection": {"edges": []}}}}
