@@ -1,0 +1,41 @@
+Statement Date: 09/10/24
+Please pay by 10/07/24
+Total Amount Due
+$115.60
+Total Current Charges
+$115.60
+Service from 08/11/24 - 09/09/24
+30 Days
+9000002
+1040
+740
+300
+Actual
+Total Charges for Electricity
+= 300 Total Billed Usage
+Generation Service Charge
+300 kWh X 0.15 $45.00
+Delivery Services
+Customer Charge
+Distribution Charge
+Transition Charge
+Transmission Charge
+Net Meter Recovery Surcharge
+Revenue Decoupling Charge
+Distributed Solar Charge
+Renewable Energy Charge
+Energy Efficiency Charge
+Electric Vehicle Program
+Provisional Syst Plan Factor
+300 kWh X 0.10 $30.00
+300 kWh X -0.01 -$3.00
+300 kWh X 0.06 $18.00
+300 kWh X 0.004 $1.20
+300 kWh X -0.002 -$0.60
+300 kWh X 0.005 $1.50
+300 kWh X 0.008 $2.40
+300 kWh X 0.03 $9.00
+300 kWh X 0.002 $0.60
+300 kWh X 0.005 $1.50
+Subtotal Delivery Services
+$70.60

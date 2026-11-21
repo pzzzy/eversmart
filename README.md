@@ -1,158 +1,64 @@
 # Eversmart
 
-Eversmart is a small Python utility for authenticated Eversource / Oracle Opower smart-meter data retrieval. It logs in to the Eversource DataBrowser experience, discovers Opower metadata, downloads available interval reads, and builds a self-contained local dashboard.
+Eversmart collects your Eversource smart-meter readings through the Opower DataBrowser and builds an offline dashboard for energy, prices, demand and bills. These are delayed utility readings, not live meter telemetry. The upstream DataBrowser is not a supported public API, so authentication or responses can change.
 
-This repository is designed as a privacy-preserving public release: no live account data, cookies, tokens, generated dashboard output, photos, or scraped data snapshots are included.
+## Set up
 
-## Features
-
-- Direct Eversource login using credentials from `.env`.
-- Optional reuse of a Netscape-format cookie jar.
-- Opower DataBrowser token/entity discovery.
-- GraphQL retrieval for:
-  - usage interval reads
-  - cost interval reads
-  - rated pricing components
-  - weather rows when available
-  - bill-history summaries
-  - demand maxima
-  - service-point metadata
-- Optional Green Button export audit/backfill.
-- Timestamped local run directories under `data/`.
-- Self-contained `dashboard.html` generation from local CSV/JSON snapshots.
-- Regression tests for parsing, token refresh, dashboard aggregation, warning handling, and chart null handling.
-
-## Privacy and safety model
-
-This tool handles authenticated utility-account information. Treat output as private.
-
-Never commit or share:
-
-- `.env`
-- `.eversource_cookies.txt`
-- `cookieinfo.txt`
-- `.opower_access_token`
-- `data/`
-- generated `dashboard.html` files containing real account data
-- screenshots or meter photos tied to a live account
-- account IDs, service agreement UUIDs, service point UUIDs, cookies, access tokens, or bill data
-
-The included `.gitignore` blocks the common sensitive artifacts.
-
-## Requirements
-
-- Python 3.11+
-- Standard-library-only runtime for the core scraper/dashboard
-- Network access to Eversource and Opower endpoints
-
-## Configuration
-
-Copy the example env file and fill in local credentials:
+Use Python 3.11 or newer on macOS or Linux. The core uses the standard library. To parse physical bill PDFs, use `pypdf`, `pdfplumber`, `pdftotext`, or the native macOS PDFKit fallback. Without a physical statement, Eversmart can chart Opower data but does not invent a statement-calibrated forecast.
 
 ```sh
-cp .env.example .env
-chmod 600 .env
+export EVERSMART_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/eversmart"
+mkdir -p -m 700 "$EVERSMART_STATE_DIR"
+[ -e "$EVERSMART_STATE_DIR/.env" ] || install -m 600 .env.example "$EVERSMART_STATE_DIR/.env"
 ```
 
-`.env`:
+Fill in `EVERSOURCE_LOGIN` and `EVERSOURCE_PASS` there, or supply them in the process environment. Use `EVERSMART_ACCOUNT` or `--account` to choose a service point if more than one is visible. The Opower entity is normally discovered; `EVERSMART_ENTITY_ID` or `--entity-id` can override discovery. `--state-dir` overrides the environment. The private state directory holds the cookie jar, history and dashboard; bearer tokens are not written to disk.
+
+## Upgrade from snapshot-only versions
+
+Import before collecting. No utility calls are made, and the original archive is not modified. Repeating the import skips already ingested snapshots. Use a dedicated private bills folder; bill files are not searched for in the checkout.
 
 ```sh
-EVERSOURCE_LOGIN=your-login-here
-EVERSOURCE_PASS=your-password-here
-EVERSMART_ACCOUNT=your-account-id-here
-EVERSMART_ENTITY_ID=your-opower-entity-id-here  # optional; normally discovered
+python3.11 eversmart.py --import-archive /path/to/old/data --render
 ```
 
-You can also pass the account/service-point id explicitly:
+Place physical PDFs or structured bill summaries in `$EVERSMART_STATE_DIR/bills/`, or use `--manual-bill-dir /path/to/private/bills`. To migrate authentication settings, copy the old `.env` into the private state directory (do not overwrite a new configuration); set its mode to `600`. You can also choose to copy the existing Netscape jar there as `.eversource_cookies.txt`. A cached Opower bearer token is not needed.
+
+## Collect and view
 
 ```sh
-python3 eversmart.py --account 'your-account-id' --out data
+python3.11 eversmart.py --login           # Optional: verify authentication
+python3.11 eversmart.py                   # One collection
+open "$EVERSMART_STATE_DIR/dashboard.html"  # macOS; on Linux open in your browser
+python3.11 eversmart.py --poll 900        # Poll with retry/backoff
+python3.11 eversmart.py --backfill        # Fetch gaps in advertised history
 ```
 
-## Usage
+The first collection downloads the latest API-sized window. Later runs refresh an overlap for delayed reads and corrections, and catch up if the collector was offline. Explicit `--interval '2026-06-03T00:00:00-04:00/2026-08-06T00:00:00-04:00'` requests are split into windows of at most 720 elapsed hours rather than silently truncated. `--resolution` selects the desired read cadence. Use `--green-button` only for occasional one-shot audits; it starts a remote export job. Use `--out` to choose a private location for new audit snapshots.
 
-Run tests:
+For scheduled use, prefer running the one-shot command under `launchd` or a systemd timer. Keep the state directory and service account consistent across invocations. The CLI rejects overlapping operations on the same state. `status.json` carries the latest operation status; the current dashboard remains available if collection or rendering fails. `--render` rebuilds it offline from the database.
+
+## How to read the numbers
+
+- SQLite reconciles overlapping polls per service point, stream, and UTC interval, preferring usable actual readings over estimates. Raw snapshots (gzip JSON and audit CSV) remain available for review; old snapshots are not deleted. Apply a local retention policy only after backing up `history.sqlite` and any raw evidence you need.
+- The dashboard separates the last successful poll, the latest actual net reading, and upstream-advertised availability. It shows local billing dates and keeps the two fall-back hours separate. Missing data is not zero. Cost-stream amounts and rate-based estimates are labeled; interval totals are not the statement balance.
+- Billing uses the newest relevant electricity usage boundary and a separately dated physical statement rate. Reconciliation distinguishes partial days from complete coverage. Forecasts are withheld if the cycle or rate cannot be established or required actual coverage is missing. Monthly EIA benchmarks are optional comparisons, not your tariff.
+
+## Share deliberately
+
+The normal dashboard, database, meter photos, statements and CSV/JSON archives are private. A display mask is not sanitization. For a standalone export containing only aggregate net kWh, estimated interval cost and peak demand — no identifiers, dates, interval data or diagnostics — run:
 
 ```sh
-python3 -m unittest discover -v
+python3.11 eversmart.py --shareable /path/to/energy-summary.html
 ```
 
-Verify login and DataBrowser token extraction:
+Those three numbers still come from your meter; review them before sharing. Keep downloaded materials and secrets out of Git. The checked-in `meter_inventory` files are sanitized model notes, not a mapping to a real customer account. See [SECURITY.md](SECURITY.md).
+
+## Develop
 
 ```sh
-python3 eversmart.py --login
+python3.11 -m unittest discover -v
+python3.11 -m compileall -q -x '(^|/)\.(git|venv)(/|$)' .
 ```
 
-Retrieve currently available data:
-
-```sh
-python3 eversmart.py --account 'your-account-id' --out data
-```
-
-Poll periodically. This is near-real-time in the sense of repeatedly collecting newly published utility intervals; it is not live meter telemetry.
-
-```sh
-python3 eversmart.py --account 'your-account-id' --poll 900 --out data
-```
-
-Request a specific interval/resolution:
-
-```sh
-python3 eversmart.py \
-  --account 'your-account-id' \
-  --interval '2026-06-03T00:00:00-04:00/2026-06-06T00:00:00-04:00' \
-  --resolution QUARTER_HOUR \
-  --out data
-```
-
-Optional Green Button audit/backfill:
-
-```sh
-python3 eversmart.py --account 'your-account-id' --out data --green-button
-```
-
-Do not run Green Button exports on every poll; they start server-side export jobs.
-
-## Output layout
-
-Each successful poll creates a timestamped directory under `data/` with files such as:
-
-- `metadata.json`
-- `usage_*.json`, `cost_*.json`, `pricing_*.json`, `weather_*.json`, `demand_maxima_*.json`
-- `usage.csv`, `cost.csv`, `pricing.csv`, `weather.csv`, `bills.csv`, `demand_maxima.csv`, `service_points.csv`
-- `manifest.json`
-- optional `green_button.zip`, `green_button_rows.csv`, `green_button_manifest.json`
-
-The scraper also regenerates a self-contained dashboard:
-
-```sh
-open dashboard.html
-```
-
-Do not publish the generated dashboard if it was built from real data.
-
-## Dashboard interpretation notes
-
-- Opower may publish new usage rows before corresponding monetary cost rows.
-- The dashboard estimates missing/zero same-day cost from rated component price when available.
-- Weather data is sparse and daily; missing temperature values are treated as missing, not zero.
-- `billForecast` can fail upstream while core usage/cost data succeeds; the tool records that as an optional warning.
-
-## Physical meter notes
-
-`meter_inventory.md` and `meter_inventory.json` document sanitized Itron Gen5 Riva observations and capability notes. Live meter serials, barcodes, module IDs, photos, and account mappings were redacted for the public release.
-
-## Development
-
-```sh
-python3 -m unittest discover -v
-python3 -m py_compile eversmart.py dashboard.py cookie_convert.py test_eversmart.py
-```
-
-## Security policy
-
-See `SECURITY.md`. Do not disclose credentials, cookies, tokens, account numbers, service UUIDs, or account-derived data in public issues.
-
-## License
-
-MIT
+Tests use synthetic fixtures and do not require utility access, a real bill, or a PDF tool. CI runs on Python 3.11 and 3.12. MIT licensed.

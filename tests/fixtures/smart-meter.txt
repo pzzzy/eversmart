@@ -1,0 +1,23 @@
+Statement Date: 07/10/24
+Please pay by 08/05/24
+Total Amount Due
+$130.00
+Total Current Charges
+$122.00
+Service from 06/11/24 - 07/09/24
+29 Days
+9000002
+416
+96
+320
+Actual
+Total Charges for Electricity
+= 320 Total Billed Usage
+320 kWh X 0.15
+$48.00
+Generation Service Charge
+320 kWh X 0.20
+$64.00
+Distribution Charge
+$10.00
+Customer Charge

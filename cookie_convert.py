@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from http.cookiejar import MozillaCookieJar
 from datetime import datetime
+import os
 import time
 
 
@@ -34,6 +35,7 @@ def parse_cookieinfo(path: str | Path, out: str | Path) -> Path:
                     pass
         lines.append("\t".join([domain, include_subdomains, cookie_path or "/", secure_flag, exp, name, value]) + "\n")
     out.write_text("".join(lines))
+    os.chmod(out, 0o600)
     return out
 
 

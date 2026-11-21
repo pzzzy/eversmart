@@ -1,0 +1,32 @@
+Statement Date: 06/11/24
+Please pay by 07/05/24
+Total Amount Due
+$125.00
+Total Current Charges
+$100.00
+Your meter was replaced on June 2, 2024
+Service from 05/10/24 - 06/02/24
+24 Days
+9000001
+404
+200
+204
+Actual
+Service Reference:
+Service from 06/03/24 - 06/10/24
+8 Days
+9000002
+96
+0
+96
+Actual
+Total Charges for Electricity
+= 300 Total Billed Usage
+300 kWh X 0.15
+$45.00
+Generation Service Charge
+300 kWh X 0.15
+$45.00
+Distribution Charge
+$10.00
+Customer Charge
