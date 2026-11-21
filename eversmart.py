@@ -1027,7 +1027,8 @@ def chunk_interval(interval: str) -> list[str]:
 
 
 def publish_dashboard(outdir: Path, output: Path, *, db_path: Path, account: str | None,
-                      shareable: bool = False, manual_bill_dir: Path | None = None, renderer=None) -> Path:
+                      shareable: bool = False, manual_bill_dir: Path | None = None,
+                      manual_bill_account: str | None = None, renderer=None) -> Path:
     if renderer is None:
         from dashboard import generate_dashboard
         renderer = generate_dashboard
@@ -1038,6 +1039,8 @@ def publish_dashboard(outdir: Path, output: Path, *, db_path: Path, account: str
         options["split_data"] = False
     if manual_bill_dir is not None and ("manual_bill_dir" in params or accepts_keywords):
         options["manual_bill_dir"] = manual_bill_dir
+    if manual_bill_account is not None and ("manual_bill_account" in params or accepts_keywords):
+        options["manual_bill_account"] = manual_bill_account
     make_private_directory(output.parent)
     with atomic_destination(output, replace=not shareable) as staged:
         renderer(outdir, staged, **options)
@@ -1420,7 +1423,8 @@ def _last_required_result(records: list[dict], account: str) -> str | None:
 def collect_once(client: EversourceClient, outdir: Path, account: str | None, interval: str | None,
                  resolution: str | None, all_service_points: bool = False, green_button: bool = False,
                  *, db_path: Path | None = None, history=None, output: Path | None = None,
-                 renderer=None, manual_bill_dir: Path | None = None, backfill: bool = False,
+                 renderer=None, manual_bill_dir: Path | None = None,
+                 manual_bill_account: str | None = None, backfill: bool = False,
                  overlap_hours: int = 72) -> dict[str, Any]:
     """Harvest to a private staging directory, commit the audit run, then ingest and render."""
     outdir = Path(outdir)
@@ -1482,7 +1486,8 @@ def collect_once(client: EversourceClient, outdir: Path, account: str | None, in
         # Dashboard publication is not part of the immutable acquisition record.
         try:
             path = publish_dashboard(outdir, output, db_path=db_path, account=manifest["account"],
-                                     manual_bill_dir=manual_bill_dir, renderer=renderer)
+                                     manual_bill_dir=manual_bill_dir, manual_bill_account=manual_bill_account,
+                                     renderer=renderer)
             result.update(dashboard=str(path), dashboard_state="published")
         except Exception as exc:
             result["dashboard_error"] = safe_error(exc, "Dashboard rendering failed; details withheld.")
@@ -1567,6 +1572,7 @@ def main(argv: list[str] | None = None, *, client_factory=None, renderer=None, s
     ap.add_argument("--render", action="store_true", help="Render an offline dashboard from local history")
     ap.add_argument("--shareable", type=Path, metavar="PATH", help="Export a redacted dashboard instead of updating the live view")
     ap.add_argument("--manual-bill-dir", type=Path, help="Override the private manual bill directory")
+    ap.add_argument("--manual-bill-account", help="Service point to trust for otherwise unassigned manual bills")
     ap.add_argument("--backfill", action="store_true", help="Fetch gaps in the available history")
     ap.add_argument("--interval", help="Override Opower time interval, e.g. 2026-06-03T00:00:00-04:00/2026-06-06T00:00:00-04:00")
     ap.add_argument("--resolution", help="Override read resolution: QUARTER_HOUR, HALF_HOUR, HOUR, DAY")
@@ -1616,6 +1622,8 @@ def main(argv: list[str] | None = None, *, client_factory=None, renderer=None, s
             try:
                 # Account and entity arguments and environment win over private config.
                 config = read_dotenv(state / ".env")
+                manual_bill_account = (args.manual_bill_account or os.environ.get("EVERSMART_MANUAL_BILL_ACCOUNT")
+                                       or config.get("EVERSMART_MANUAL_BILL_ACCOUNT"))
                 account = args.account or os.environ.get("EVERSMART_ACCOUNT") or config.get("EVERSMART_ACCOUNT")
                 entity = args.entity_id or os.environ.get("EVERSMART_ENTITY_ID") or config.get("EVERSMART_ENTITY_ID")
                 if args.import_archive:
@@ -1646,7 +1654,8 @@ def main(argv: list[str] | None = None, *, client_factory=None, renderer=None, s
                                                                          cookieinfo=args.cookieinfo, state_dir=state, entity_id=entity)
                         return collect_once(client, outdir, account, args.interval, args.resolution,
                                             args.all_service_points, args.green_button, db_path=db_path, output=output,
-                                            backfill=args.backfill, renderer=renderer, manual_bill_dir=manual_bill_dir)
+                                            backfill=args.backfill, renderer=renderer, manual_bill_dir=manual_bill_dir,
+                                            manual_bill_account=manual_bill_account)
 
                     code = _supervise(collect_operation, state, args.poll, sleep)
                     if code:
@@ -1656,7 +1665,8 @@ def main(argv: list[str] | None = None, *, client_factory=None, renderer=None, s
                     with process_lock(db_path.with_suffix(db_path.suffix + ".lock")):
                         publish_dashboard(outdir, args.shareable or output, db_path=db_path,
                                           account=_history_account(db_path, account),
-                                          shareable=bool(args.shareable), manual_bill_dir=manual_bill_dir, renderer=renderer)
+                                          shareable=bool(args.shareable), manual_bill_dir=manual_bill_dir,
+                                          manual_bill_account=manual_bill_account, renderer=renderer)
                     _report_status(state, {"status": "exported" if args.shareable else "rendered"},
                                    persist=not args.shareable)
                 return 0

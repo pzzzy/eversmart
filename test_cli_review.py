@@ -92,6 +92,16 @@ class CliReviewTests(unittest.TestCase):
         self.assertEqual(eversmart.main(['--state-dir', str(broad), '--render']), 1)
         self.assertEqual(list(broad.iterdir()), [])
 
+    def test_render_passes_explicit_manual_bill_meter_scope(self):
+        observed = []
+        def render(data_dir, staging, **kwargs):
+            observed.append(kwargs['manual_bill_account'])
+            staging.write_text('dashboard')
+        result = self.main('--render', '--account', 'synthetic-meter',
+                           '--manual-bill-account', 'synthetic-meter', renderer=render)
+        self.assertEqual(result, 0)
+        self.assertEqual(observed, ['synthetic-meter'])
+
     def test_archive_import_reports_skipped_invalid_run(self):
         bad = self.audit / '20260102T120000Z'
         bad.mkdir()

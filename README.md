@@ -22,7 +22,7 @@ Import before collecting. No utility calls are made, and the original archive is
 python3.11 eversmart.py --import-archive /path/to/old/data --render
 ```
 
-Place physical PDFs or structured bill summaries in `$EVERSMART_STATE_DIR/bills/`, or use `--manual-bill-dir /path/to/private/bills`. To migrate authentication settings, copy the old `.env` into the private state directory (do not overwrite a new configuration); set its mode to `600`. You can also choose to copy the existing Netscape jar there as `.eversource_cookies.txt`. A cached Opower bearer token is not needed.
+Place physical PDFs or structured bill summaries in `$EVERSMART_STATE_DIR/bills/`, or use `--manual-bill-dir /path/to/private/bills`. If more than one service point is visible, put `utility_id` in each structured summary or use `--manual-bill-account SERVICE_POINT` (or `EVERSMART_MANUAL_BILL_ACCOUNT` in the private `.env`) only for a directory whose unassigned bills all belong to that service point. To migrate authentication settings, copy the old `.env` into the private state directory (do not overwrite a new configuration); set its mode to `600`. You can also choose to copy the existing Netscape jar there as `.eversource_cookies.txt`. A cached Opower bearer token is not needed.
 
 ## Collect and view
 
